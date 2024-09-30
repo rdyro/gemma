@@ -22,11 +22,15 @@ import jax.numpy as jnp
 class Einsum(nn.Module):
   """Einsum is a convenience module for parameterized tensor multiplication."""
   shape: tuple[int, ...]
+  axis_names: list[str]
+  
+  def setup(self):
+    weight_init_fn = nn.with_logical_partitioning(nn.initializers.normal(), 
+                                                  self.axis_names)
+    self.w = self.param('w', weight_init_fn, self.shape)
 
-  @nn.compact
   def __call__(self, eqn: str, x: jax.Array) -> jax.Array:
-    w = self.param('w', nn.initializers.normal(), self.shape)
-    return jnp.einsum(eqn, x, w)
+    return jnp.einsum(eqn, x, self.w)
 
 
 class RMSNorm(nn.Module):
@@ -34,7 +38,9 @@ class RMSNorm(nn.Module):
 
   @nn.compact
   def __call__(self, x):
-    scale = self.param('scale', nn.initializers.zeros_init(), (x.shape[-1]))
+    scale_init = nn.with_logical_partitioning(nn.initializers.zeros_init(), 
+                                              ("features",))
+    scale = self.param('scale', scale_init, (x.shape[-1]))
     var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
 
     # Jax.lax.rsqrt is used because it returns different floats than

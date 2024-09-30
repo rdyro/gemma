@@ -73,13 +73,17 @@ class TransformerConfig:
 
   def query_pre_attn_scalar(self) -> float:
     """Returns the scalar to multiply the query by before attention."""
-    match self.query_pre_attn_norm:
-      case QueryPreAttentionNormalisation.BY_EMBED_DIM_DIV_NUM_HEADS:
-        return self.embed_dim // self.num_heads
-      case QueryPreAttentionNormalisation.BY_ONE_OVER_SQRT_EMBED_DIM_DIV_NUM_HEADS:  # pylint: disable=line-too-long
-        return (self.embed_dim // self.num_heads)**-0.5
-      case QueryPreAttentionNormalisation.BY_ONE_OVER_SQRT_HEAD_DIM | _:
-        return self.head_dim**-0.5
+    if (self.query_pre_attn_norm 
+        == QueryPreAttentionNormalisation.BY_EMBED_DIM_DIV_NUM_HEADS):
+      return self.embed_dim // self.num_heads
+    elif (self.query_pre_attn_norm 
+          == QueryPreAttentionNormalisation.BY_ONE_OVER_SQRT_EMBED_DIM_DIV_NUM_HEADS):
+      return (self.embed_dim // self.num_heads)**-0.5
+    elif (self.query_pre_attn_norm 
+          == QueryPreAttentionNormalisation.BY_ONE_OVER_SQRT_HEAD_DIM):
+      return self.head_dim**-0.5
+    else:
+      return self.head_dim**-0.5
 
   @classmethod
   def from_params(
