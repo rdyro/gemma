@@ -231,6 +231,7 @@ class TransformerConfig:
       self,
       batch_size: int,
       dtype: jnp.dtype = jnp.bfloat16,
+      logically_partitioned: bool = False,
   ) -> Cache:
     """Initializes a new Transformer cache."""
     cache = {
@@ -240,6 +241,7 @@ class TransformerConfig:
             self.head_dim,
             batch_size,
             dtype,
+            logically_partitioned=logically_partitioned,
         )
         for i in range(self.num_layers)
     }

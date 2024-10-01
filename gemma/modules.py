@@ -230,6 +230,7 @@ class Attention(nn.Module):
       head_dim: int,
       batch_size: int,
       dtype: jnp.dtype = jnp.bfloat16,
+      logically_partitioned: bool = False,
   ) -> LayerCache:
     del cls  # not used
     v = nn.LogicallyPartitioned(jnp.zeros(
@@ -238,11 +239,11 @@ class Attention(nn.Module):
     k = nn.LogicallyPartitioned(jnp.zeros(
       (batch_size, cache_size, num_heads, head_dim), dtype=dtype), 
       ("batch", "sequence", "kv_heads", "head_dim"))
-    return {
-        'v': v,
-        'k': k,
-        'end_index': jnp.zeros((batch_size,), dtype=jnp.int32),
-    }
+    end_index = nn.LogicallyPartitioned(
+      jnp.zeros((batch_size,), dtype=jnp.int32), ("batch",))
+    if not logically_partitioned:
+      k, v, end_index = k.value, v.value, end_index.value
+    return {'v': v, 'k': k, 'end_index': end_index}
 
 
 class FeedForward(nn.Module):
