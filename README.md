@@ -1,3 +1,11 @@
+# Recent Revisions
+
+- model parameters now wrapped in "flax.linen.LogicallyPartitioned" for 
+partitioning using logical axes names
+- new quickstart for sharded model loading and batched autoregressive decoding: [sharded_model_quickstart.ipynb](./sharded_model_quickstart.ipynb)
+
+---
+
 # Gemma
 
 [Gemma](https://ai.google.dev/gemma) is a family of open-weights Large Language
