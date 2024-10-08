@@ -15,7 +15,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from flax import linen as nn
 
 from gemma import params as params_lib
-from gemma import sampler as sampler_lib
 from gemma import transformer as transformer_lib
 import sentencepiece as spm
 import kagglehub
@@ -27,7 +26,7 @@ pprint([f"{k} = {v}" for k, v in os.environ.items() if k.startswith("XLA")])
 jax.config.update("jax_compilation_cache_dir", 
                   str(Path("~/.cache/jax_compilation_cache").expanduser()))
 
-# variants version v1 have gemma/Flax
+# variants v1 have gemma/Flax
 # variant = '2b-it' # @param ['2b', '2b-it', '7b', '7b-it'] {type:"string"}
 # weights_dir = kagglehub.model_download(f'google/gemma/Flax/{variant}')
 
@@ -64,21 +63,15 @@ def construct_positions_and_attn_mask(input: jax.Array, max_len: int,
                                      * padded_input_mask[..., None, :])
   return positions, attention_mask
 
-
-# alternatively: 
-# with jax.default_device(cpu_device):
-#   params_host = params_lib.load_and_format_params(ckpt_path)
-# config = transformer_lib.TransformerConfig.from_params(
-#     params_host,
-#     cache_size=128  # Number of time steps in the transformer's cache
-# )
 config = transformer_lib.TransformerConfig.gemma2_2b(cache_size=128)
 transformer = transformer_lib.Transformer(config)
 
+# parameters are wrapped in nn.LogicallyPartitioned wrapper to allow 
+# logical sharding using physical axes (via translation rules)
 is_param = lambda x: isinstance(x, nn.LogicallyPartitioned)
 
 def init_params(batch_size: int, dtype=jnp.bfloat16):
-  input_len = 1 # or 1 or 7, this dimension doesn't matter in initialization
+  input_len = 7 # or 1 or 7, this dimension doesn't matter in initialization
   random_key = random.key(0)
   input_sequence = jnp.zeros((batch_size, input_len), dtype=jnp.int32)
   positions, attn_mask = construct_positions_and_attn_mask(
@@ -91,9 +84,13 @@ def init_params(batch_size: int, dtype=jnp.bfloat16):
   return (params, cache)
   
 # we use jax.eval_shape to get just the shape of the parameters for sharding
-BATCH_SIZE = 1
+BATCH_SIZE = 3
 params_struct, cache_struct = jax.eval_shape(lambda: init_params(BATCH_SIZE))
 
+# now, construct the logical partitioning constraints
+# technically data (including parameters) sharding and activation sharding
+# are separate concepts, we use a common ruleset for both
+# NOTE: it's possible to assign a list of physical axes as values in the rules
 axis_names = jax.tree.reduce(lambda x, y: x | set(y.names),
         (params_struct, cache_struct), initializer=set(), is_leaf=is_param)
 print(f"logical axis names = {axis_names}")
@@ -102,20 +99,27 @@ model_parallel_rules = {
   "batch": None,
   "sequence": None,
   "vocab": None, 
-  "features": "x",  # or 'd_model'
+  "features": "x",
   "q_heads": None, 
   "kv_heads": None, 
   "head_dim": None, 
-  "ffw": None
+  "ffw": None,
+  "act_batch": None,
+  "act_sequence": None,
+  "act_heads": None,
+  "act_kv_heads": None,
+  "act_head_dim": None,
 }
 assert all(k in model_parallel_rules for k in axis_names)
 
-mesh = Mesh(devices, ("x",))
-rules = model_parallel_rules
+GLOBAL_MESH = Mesh(devices, ("x",))
+GLOBAL_RULES = model_parallel_rules
 params_sharding, cache_sharding = jax.tree.map(
-  lambda x: NamedSharding(mesh, P(*[rules[name] for name in x.names])),
-  (params_struct, cache_struct), is_leaf=is_param)
+  lambda x: NamedSharding(GLOBAL_MESH, 
+                          P(*[GLOBAL_RULES[name] for name in x.names])), 
+                          (params_struct, cache_struct), is_leaf=is_param)
 
+# we perform this under jit to control the output parameter and cache sharding
 @functools.partial(jax.jit, static_argnums=(0, 1), 
                    out_shardings=(params_sharding, cache_sharding))
 def unpack_params(batch_size: int, dtype=jnp.bfloat16
@@ -130,10 +134,11 @@ def unpack_params(batch_size: int, dtype=jnp.bfloat16
   return jax.tree.map(lambda x: x.value, params_cache, is_leaf=is_param)
 
 
-LOAD_PRETRAINED_PARAMETERS = True
+# either load pre-trained parameters or initialize random parameters
+LOAD_PARAMETERS = True
 DTYPE = jnp.bfloat16
 
-if LOAD_PRETRAINED_PARAMETERS:
+if LOAD_PARAMETERS:
   with jax.default_device(cpu_device):
     params_host = params_lib.load_and_format_params(ckpt_path)
     params = jax.tree.map(lambda x, y: jax.device_put(x.astype(DTYPE), y), 
@@ -141,7 +146,8 @@ if LOAD_PRETRAINED_PARAMETERS:
 else:                
   params, cache = unpack_params(BATCH_SIZE)
 
-def get_size(arr: jax.Array):
+# compute the byte size the model parameters are occupying
+def get_byte_size(arr: jax.Array):
   shard_shapes = [shard.data.shape for shard in arr.addressable_shards]
   global_shape = arr.shape
   per_host_local_size = sum(math.prod(local_shape) * arr.dtype.itemsize 
@@ -150,11 +156,11 @@ def get_size(arr: jax.Array):
   global_size = math.prod(global_shape) * arr.dtype.itemsize
   return (global_size, per_host_local_size, per_device_local_size)
   
-def reduce_size(size1, size2):
+def reduce_byte_size(size1, size2):
   return tuple(x1 + x2 for (x1, x2) in zip(size1, size2))
 
 global_size, per_host_size, per_device_size = jax.tree.reduce(
-  reduce_size, jax.tree.map(get_size, params), initializer=(0, 0, 0), 
+  reduce_byte_size, jax.tree.map(get_byte_size, params), initializer=(0, 0, 0), 
   is_leaf=lambda a: isinstance(a, tuple))
 print(f"Global model size in bytes:     {global_size / (1024 ** 3):.4f} GB")
 print(f"Per-host model size in bytes:   {per_host_size / (1024 ** 3):.4f} GB")
@@ -163,7 +169,23 @@ print(f"Per-device model size in bytes: {per_device_size / (1024 ** 3):.4f} GB")
 # visualize the sharding on an example layer
 jax.debug.visualize_array_sharding(params["params"]["layer_0"]["mlp"]["linear"])
 
+# IMPORTANT: we need a forward pass through the model with
+# - a mesh 
+# - logical axis rules
+# so that activation sharding constraints are applied during the forward pass
+def model_forward(params: dict[str, Any], cache: dict[str, Any], 
+                  input: jax.Array, positions: jax.Array, 
+                  attention_mask: jax.Array, 
+                  mesh: Mesh, rules: list[tuple[str, list[str] | str | None]]):
 
+  # flax expects the rules as a list of tuples, not a dict
+  if isinstance(rules, dict):  
+    rules = list(rules.items())
+
+  with mesh, nn.logical_axis_rules(rules):
+    return transformer.apply(params, input, positions, cache, attention_mask)
+
+# prefill populates the cache
 @functools.partial(jax.jit, static_argnames=("config",), 
                    in_shardings=(params_sharding,  None))
 def prefill(params: dict[str, Any], input: jax.Array, 
@@ -175,11 +197,13 @@ def prefill(params: dict[str, Any], input: jax.Array,
   dtype = jax.tree.flatten(params)[0][0].dtype
   cache = jax.lax.with_sharding_constraint(
     config.init_cache(batch_size, dtype=dtype), cache_sharding)
-  logits, cache = transformer.apply(params, input, positions, cache, 
-                                    attention_mask)
+  logits, cache = model_forward(params, cache, input, positions, attention_mask, 
+                                GLOBAL_MESH, GLOBAL_RULES)
   return logits, cache
 
 
+# Tokenization and right-alignement of sequences in batch
+# for efficient prefill + autoregressive decoding
 def id_from_str(text: str):
   tokens = vocab.Encode(text)
   assert len(tokens) == 1 and isinstance(tokens[0], int)
@@ -206,10 +230,12 @@ batch_input = right_align_sequences(["hello, how are you?",
 input = jnp.asarray(batch_input, dtype=jnp.int32)
 positions, attn_mask = construct_positions_and_attn_mask(input, input.shape[-1])
 
-print(f"example batch_input =\n{batch_input}")
-print(f"example positions =\n{positions}")
-print(f"example attn_mask =\n{attn_mask * 1}")
+print(f"Example batch_input =\n{batch_input}")
+print(f"Example positions =\n{positions}")
+print(f"Example attn_mask =\n{attn_mask * 1}")
 
+
+# The decoding step
 @functools.partial(jax.jit, static_argnames=("config", "max_len"), 
                    in_shardings=(params_sharding, cache_sharding, None))
 def decode(params: dict[str, Any], cache: dict[str, Any], input: jax.Array, 
@@ -233,8 +259,9 @@ def decode(params: dict[str, Any], cache: dict[str, Any], input: jax.Array,
     last_tokens = tokens[..., i-1][..., None]
     curr_positions = positions[..., i-1][..., None]
     curr_attn_mask = attn_mask[..., i-1, :][..., None, :]
-    logits, cache = transformer.apply(params, last_tokens, curr_positions, 
-                                      cache, curr_attn_mask)                                     
+
+    logits, cache = model_forward(params, cache, last_tokens, curr_positions, 
+                                  curr_attn_mask, GLOBAL_MESH, GLOBAL_RULES)
     next_tokens = jnp.argmax(logits, -1)[..., 0]
     tokens = tokens.at[..., i].set(next_tokens)
     carry = (tokens, cache)
@@ -249,6 +276,7 @@ def decode(params: dict[str, Any], cache: dict[str, Any], input: jax.Array,
   return new_tokens
 
 
+# test the actual model using prefill -> decode
 logits, prefilled_cache = prefill(params, batch_input, config)
 new_tokens = decode(params, prefilled_cache, batch_input, config, 128)
 
@@ -256,6 +284,5 @@ for i in range(batch_input.shape[0]):
   print(f"Prompt {i}: `{vocab.Decode(batch_input[i, :].tolist())}`")
 print("#" * 80)
 for i in range(new_tokens.shape[0]):
-  print(f"Full Response {i}:\n```\n"
-        f"{vocab.Decode(new_tokens[i, :].tolist())}\n```")
+  print(f"Response {i}:\n```\n{vocab.Decode(new_tokens[i, :].tolist())}\n```")
   print("-" * 80)
