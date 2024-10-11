@@ -15,11 +15,14 @@
 """Transformer sub-modules."""
 
 import enum
+from dataclasses import dataclass
+
 from flax import linen as nn
 from gemma import layers
 from gemma import positional_embeddings
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 K_MASK = -2.3819763e38  # Set to a large negative number.
 LayerCache = dict[str, jax.Array]
@@ -62,30 +65,24 @@ class AttentionType(enum.Enum):
   LOCAL_SLIDING = 2
 
 
-class Embedder(nn.Module):
+class Embedder(nnx.Module):
   """Embedder module."""
-
-  vocab_size: int
-  embed_dim: int
-
-  def setup(self):
-    self.input_embedding_table = self.param(
-        'input_embedding',
-        nn.with_logical_partitioning(nn.initializers.normal(), 
-                                     ("vocab", "features")),
-        (self.vocab_size, self.embed_dim),
-    )
+  def __init__(self, vocab_size: int, embed_dim: int, rngs: nnx.Rngs):
+    self.vocab_size, self.embed_dim = vocab_size, embed_dim
+    self.input_embedding = nnx.Param(nn.initializers.normal()(
+      rngs(), (self.vocab_size, self.embed_dim)), names=("vocab", "features"))
 
   def encode(self, x: jax.Array) -> jax.Array:
-    x = self.input_embedding_table[(x,)]
+    x = self.input_embedding.value[(x,)]
     x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
     return x
 
   def decode(self, x: jax.Array) -> jax.Array:
-    return jnp.dot(x, self.input_embedding_table.T)
+    return jnp.dot(x, self.input_embedding.value.T)
 
 
-class Attention(nn.Module):
+@dataclass
+class Attention(nnx.Module):
   """Attention module."""
 
   num_heads: int
@@ -96,6 +93,33 @@ class Attention(nn.Module):
   query_pre_attn_scalar: float
   attn_logits_soft_cap: float | None = None
   sliding_window_size: int | None = None
+  rngs: nnx.Rngs | None = None
+  
+  def __post_init__(self):
+    self.attn_vec_einsum = layers.Einsum(
+        shape=(self.num_heads, self.head_dim, self.features),
+        axis_names=("kv_heads", "head_dim", "features"),
+        rngs=self.rngs,
+    )
+
+    if self.use_qkv_einsum:
+      self.qkv_einsum = layers.Einsum(
+          shape=(3, self.num_heads, self.features, self.head_dim),
+          axis_names=(None, "kv_heads", "features", "head_dim"),
+          rngs=self.rngs,
+      )
+    else:
+      self.q_einsum = layers.Einsum(
+          shape=(self.num_heads, self.features, self.head_dim),
+          axis_names=("q_heads", "features", "head_dim"),
+          rngs=self.rngs,
+      )
+      self.kv_einsum = layers.Einsum(
+          shape=(2, self.num_kv_heads, self.features, self.head_dim),
+          axis_names=(None, "kv_heads", "features", "head_dim"),
+          rngs=self.rngs,
+      )
+    self.rngs = None
 
   @property
   def use_qkv_einsum(self):
@@ -104,27 +128,6 @@ class Attention(nn.Module):
   @property
   def use_gqa(self):
     return self.num_kv_heads != self.num_heads and self.num_kv_heads > 1
-
-  def setup(self):
-    self.attn_vec_einsum = layers.Einsum(
-        shape=(self.num_heads, self.head_dim, self.features),
-        axis_names=("kv_heads", "head_dim", "features"),
-    )
-
-    if self.use_qkv_einsum:
-      self.qkv_einsum = layers.Einsum(
-          shape=(3, self.num_heads, self.features, self.head_dim),
-          axis_names=(None, "kv_heads", "features", "head_dim"),
-      )
-    else:
-      self.q_einsum = layers.Einsum(
-          shape=(self.num_heads, self.features, self.head_dim),
-          axis_names=("q_heads", "features", "head_dim"),
-      )
-      self.kv_einsum = layers.Einsum(
-          shape=(2, self.num_kv_heads, self.features, self.head_dim),
-          axis_names=(None, "kv_heads", "features", "head_dim"),
-      )
 
   def __call__(
       self,
@@ -155,15 +158,15 @@ class Attention(nn.Module):
 
     # Cache is left aligned.
     if cache is not None:
-      end_index = cache['end_index'][0]
-      slice_indices = (0, end_index % cache['v'].shape[1], 0, 0)
+      end_index = cache['end_index'].value[0]
+      slice_indices = (0, end_index % cache['v'].value.shape[1], 0, 0)
       value_proj = jax.lax.dynamic_update_slice(
-          cache['v'],
+          cache['v'].value,
           value_proj,
           slice_indices,
       )
       key_proj = jax.lax.dynamic_update_slice(
-          cache['k'], key_proj, slice_indices
+          cache['k'].value, key_proj, slice_indices
       )
 
     if self.use_gqa:
@@ -189,7 +192,7 @@ class Attention(nn.Module):
         )
       sliding_mask = _create_sliding_mask(
           segment_pos,
-          end_index=cache['end_index'][0] if cache is not None else 0,
+          end_index=cache['end_index'].value[0] if cache is not None else 0,
           # Derive cache length from attn_mask shape in case cache is None
           cache_len=attn_mask.shape[-1],
           sliding_window_size=self.sliding_window_size,
@@ -213,9 +216,10 @@ class Attention(nn.Module):
 
     if cache is not None:
       new_cache = {
-          'v': value_proj,
-          'k': key_proj,
-          'end_index': cache['end_index'] + seq_len,
+          'v': nnx.Variable(value_proj, names=cache['v'].names),
+          'k': nnx.Variable(key_proj, names=cache['k'].names),
+          'end_index': nnx.Variable(cache['end_index'].value + seq_len, 
+                                    names=cache['end_index'].names),
       }
     else:
       new_cache = None
@@ -230,70 +234,59 @@ class Attention(nn.Module):
       head_dim: int,
       batch_size: int,
       dtype: jnp.dtype = jnp.bfloat16,
-      logically_partitioned: bool = False,
   ) -> LayerCache:
     del cls  # not used
-    v = nn.LogicallyPartitioned(jnp.zeros(
+    v = nnx.Variable(jnp.zeros(
       (batch_size, cache_size, num_heads, head_dim), dtype=dtype), 
-      ("batch", "sequence", "kv_heads", "head_dim"))
-    k = nn.LogicallyPartitioned(jnp.zeros(
+      names=("batch", "sequence", "kv_heads", "head_dim"))
+    k = nnx.Variable(jnp.zeros(
       (batch_size, cache_size, num_heads, head_dim), dtype=dtype), 
-      ("batch", "sequence", "kv_heads", "head_dim"))
-    end_index = nn.LogicallyPartitioned(
-      jnp.zeros((batch_size,), dtype=jnp.int32), ("batch",))
-    if not logically_partitioned:
-      k, v, end_index = k.value, v.value, end_index.value
+      names=("batch", "sequence", "kv_heads", "head_dim"))
+    end_index = nnx.Variable(
+      jnp.zeros((batch_size,), dtype=jnp.int32), names=("batch",))
     return {'v': v, 'k': k, 'end_index': end_index}
 
 
-class FeedForward(nn.Module):
+class FeedForward(nnx.Module):
   """Feed forward module."""
-
-  features: int
-  hidden_dim: int
-  transpose_gating_einsum: bool
-
-  @nn.compact
+  def __init__(self, features: int, hidden_dim: int, 
+               transpose_gating_einsum: bool, rngs: nnx.Rngs):
+    self.features = features
+    self.hidden_dim = hidden_dim
+    self.transpose_gating_einsum = transpose_gating_einsum
+    if self.transpose_gating_einsum:
+      gating_einsum = nnx.Param(
+        nnx.initializers.normal()(rngs(), (2, self.hidden_dim, self.features)), 
+        names=(None, "ffw", "features"))
+      self.gating_einsum = gating_einsum.transpose((0, 2, 1))
+    else:
+      self.gating_einsum = nnx.Param(
+        nnx.initializers.normal()(rngs(), (2, self.features, self.hidden_dim)), 
+        names=(None, "ffw", "features"))
+    self.linear = nnx.Param(
+      jnp.zeros((self.hidden_dim, self.features)), names=("ffw", "features"))
+    
   def __call__(self, x):
     # Some versions use an alternate parameter ordering that
     # transposes hidden_dim and features.
-    if self.transpose_gating_einsum:
-      w_gating = self.param(
-          'gating_einsum',
-          nn.with_logical_partitioning(nn.initializers.normal(),
-                                       (None, "ffw", "features"))
-          ((2, self.hidden_dim, self.features)),
-      )
-      w_gating = w_gating.transpose((0, 2, 1))
-    else:
-      w_gating = self.param(
-          'gating_einsum',
-          nn.with_logical_partitioning(nn.initializers.normal(), 
-                                       (None, "features", "ffw")),
-          ((2, self.features, self.hidden_dim)),
-      )
-    ff_gate = jnp.dot(x, w_gating[0])
+    ff_gate = jnp.dot(x, self.gating_einsum.value[0])
     gate_value = nn.gelu(ff_gate)
 
     # Up projection
-    ff1 = jnp.dot(x, w_gating[1])
+    ff1 = jnp.dot(x, self.gating_einsum.value[1])
     activations = gate_value * ff1
 
     # Down projection
-    w_linear = self.param(
-        'linear',
-        nn.with_logical_partitioning(nn.initializers.zeros_init(), 
-                                     ("ffw", "features")),
-        (self.hidden_dim, self.features),
-    )
-    outputs = jnp.dot(activations, w_linear)
+    outputs = jnp.dot(activations, self.linear.value)
 
     return outputs
 
 
-class Block(nn.Module):
+@dataclass
+class Block(nnx.Module):
   """Transformer block."""
 
+  name: str
   num_heads: int
   num_kv_heads: int
   embed_dim: int
@@ -306,9 +299,10 @@ class Block(nn.Module):
   transpose_gating_einsum: bool
   attn_logits_soft_cap: float | None = None
   sliding_window_size: int | None = None
-
-  def setup(self):
-    self.pre_attention_norm = layers.RMSNorm()
+  rngs: nnx.Rngs | None = None
+  
+  def __post_init__(self):
+    self.pre_attention_norm = layers.RMSNorm(self.embed_dim)
     self.attn = Attention(
         num_heads=self.num_heads,
         features=self.embed_dim,
@@ -318,20 +312,23 @@ class Block(nn.Module):
         query_pre_attn_scalar=self.query_pre_attn_scalar,
         attn_logits_soft_cap=self.attn_logits_soft_cap,
         sliding_window_size=self.sliding_window_size,
+        rngs=self.rngs,
     )
     self.post_attention_norm = None
     if self.use_post_attn_norm:
-      self.post_attention_norm = layers.RMSNorm()
+      self.post_attention_norm = layers.RMSNorm(self.embed_dim)
 
-    self.pre_ffw_norm = layers.RMSNorm()
+    self.pre_ffw_norm = layers.RMSNorm(self.embed_dim)
     self.mlp = FeedForward(
         features=self.embed_dim,
         hidden_dim=self.hidden_dim,
         transpose_gating_einsum=self.transpose_gating_einsum,
+        rngs=self.rngs,
     )
     self.post_ffw_norm = None
     if self.use_post_ffw_norm:
-      self.post_ffw_norm = layers.RMSNorm()
+      self.post_ffw_norm = layers.RMSNorm(self.embed_dim)
+    self.rngs = None
 
   def __call__(
       self,

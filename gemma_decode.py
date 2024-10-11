@@ -13,12 +13,13 @@ from jax import numpy as jnp
 from jax import random
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from flax import linen as nn
+from flax import nnx
 
 from gemma import params as params_lib
 from gemma import transformer as transformer_lib
 import sentencepiece as spm
 import kagglehub
-# kagglehub.login() # you might need to log in
+#kagglehub.login() # you might need to log in
 
 cpu_device, devices = jax.devices("cpu")[0], jax.devices("cuda")
 pprint([f"{k} = {v}" for k, v in os.environ.items() if k.startswith("XLA")])
@@ -38,7 +39,7 @@ vocab_path = os.path.join(weights_dir, 'tokenizer.model')
 vocab = spm.SentencePieceProcessor()
 vocab.Load(vocab_path)
 PAD_ID = vocab.pad_id()
-
+print(f"{PAD_ID = }")
 
 @functools.partial(jax.jit, static_argnums=(0, 1))
 def casual_attention_mask(seq_len: int, max_seq_len: int) -> jax.Array:
@@ -63,12 +64,27 @@ def construct_positions_and_attn_mask(input: jax.Array, max_len: int,
                                      * padded_input_mask[..., None, :])
   return positions, attention_mask
 
-config = transformer_lib.TransformerConfig.gemma2_2b(cache_size=128)
-transformer = transformer_lib.Transformer(config)
 
-# parameters are wrapped in nn.LogicallyPartitioned wrapper to allow 
-# logical sharding using physical axes (via translation rules)
-is_param = lambda x: isinstance(x, nn.LogicallyPartitioned)
+# with jax.default_device(cpu_device):
+#   params_host = params_lib.load_and_format_params(ckpt_path)
+# config = transformer_lib.TransformerConfig.from_params(
+#     params_host,
+#     cache_size=128  # Number of time steps in the transformer's cache
+# )
+config = transformer_lib.TransformerConfig.gemma2_2b(cache_size=128)
+#transformer = transformer_lib.Transformer(config)
+
+def fn(config):
+  model = transformer_lib.Transformer(config)
+  #return nnx.split(model)
+  return nnx.graphdef(model)
+
+transformer_graphdef = jax.eval_shape(
+  lambda: nnx.graphdef(transformer_lib.Transformer(config)))
+
+# +
+is_param = lambda x: isinstance(x, nnx.VariableState)
+config = transformer_lib.TransformerConfig.gemma2_2b(cache_size=128)
 
 def init_params(batch_size: int, dtype=jnp.bfloat16):
   input_len = 7 # or 1 or 7, this dimension doesn't matter in initialization
@@ -76,21 +92,16 @@ def init_params(batch_size: int, dtype=jnp.bfloat16):
   input_sequence = jnp.zeros((batch_size, input_len), dtype=jnp.int32)
   positions, attn_mask = construct_positions_and_attn_mask(
     input_sequence, config.max_cache_length)
-  cache = config.init_cache(batch_size, jnp.float32, logically_partitioned=True)
+  cache = config.init_cache(batch_size, jnp.float32)
   cache_value = jax.tree.map(lambda x: x.value if is_param(x) else x, cache, 
                              is_leaf=is_param)
-  params = transformer.init(random_key, input_sequence, positions, 
-                            cache_value, attn_mask)
-  return (params, cache)
+  transformer = transformer_lib.Transformer(config)
+  return nnx.state(transformer), nnx.state(cache)
   
 # we use jax.eval_shape to get just the shape of the parameters for sharding
 BATCH_SIZE = 3
-params_struct, cache_struct = jax.eval_shape(lambda: init_params(BATCH_SIZE))
+params_struct, cache_struct = nnx.eval_shape(lambda: init_params(BATCH_SIZE))
 
-# now, construct the logical partitioning constraints
-# technically data (including parameters) sharding and activation sharding
-# are separate concepts, we use a common ruleset for both
-# NOTE: it's possible to assign a list of physical axes as values in the rules
 axis_names = jax.tree.reduce(lambda x, y: x | set(y.names),
         (params_struct, cache_struct), initializer=set(), is_leaf=is_param)
 print(f"logical axis names = {axis_names}")
@@ -119,7 +130,6 @@ params_sharding, cache_sharding = jax.tree.map(
                           P(*[GLOBAL_RULES[name] for name in x.names])), 
                           (params_struct, cache_struct), is_leaf=is_param)
 
-# we perform this under jit to control the output parameter and cache sharding
 @functools.partial(jax.jit, static_argnums=(0, 1), 
                    out_shardings=(params_sharding, cache_sharding))
 def unpack_params(batch_size: int, dtype=jnp.bfloat16
@@ -134,20 +144,23 @@ def unpack_params(batch_size: int, dtype=jnp.bfloat16
   return jax.tree.map(lambda x: x.value, params_cache, is_leaf=is_param)
 
 
-# either load pre-trained parameters or initialize random parameters
 LOAD_PARAMETERS = True
 DTYPE = jnp.bfloat16
 
 if LOAD_PARAMETERS:
   with jax.default_device(cpu_device):
     params_host = params_lib.load_and_format_params(ckpt_path)
+    params_host = nnx.state(params_host["transformer"])
     params = jax.tree.map(lambda x, y: jax.device_put(x.astype(DTYPE), y), 
-                          {"params": params_host["transformer"]}, params_sharding)
+                          params_host, params_sharding)
 else:                
   params, cache = unpack_params(BATCH_SIZE)
+  cache = nnx.state(jax.tree.map(nnx.Variable, cache))
+params = nnx.state(jax.tree.map(nnx.Param, params))
 
-# compute the byte size the model parameters are occupying
-def get_byte_size(arr: jax.Array):
+def get_size(arr: jax.Array):
+  if isinstance(arr, nnx.Variable):
+    arr = arr.value
   shard_shapes = [shard.data.shape for shard in arr.addressable_shards]
   global_shape = arr.shape
   per_host_local_size = sum(math.prod(local_shape) * arr.dtype.itemsize 
@@ -156,23 +169,20 @@ def get_byte_size(arr: jax.Array):
   global_size = math.prod(global_shape) * arr.dtype.itemsize
   return (global_size, per_host_local_size, per_device_local_size)
   
-def reduce_byte_size(size1, size2):
+def reduce_size(size1, size2):
   return tuple(x1 + x2 for (x1, x2) in zip(size1, size2))
 
 global_size, per_host_size, per_device_size = jax.tree.reduce(
-  reduce_byte_size, jax.tree.map(get_byte_size, params), initializer=(0, 0, 0), 
+  reduce_size, jax.tree.map(get_size, params), initializer=(0, 0, 0), 
   is_leaf=lambda a: isinstance(a, tuple))
 print(f"Global model size in bytes:     {global_size / (1024 ** 3):.4f} GB")
 print(f"Per-host model size in bytes:   {per_host_size / (1024 ** 3):.4f} GB")
 print(f"Per-device model size in bytes: {per_device_size / (1024 ** 3):.4f} GB")
 
 # visualize the sharding on an example layer
-jax.debug.visualize_array_sharding(params["params"]["layer_0"]["mlp"]["linear"])
+jax.debug.visualize_array_sharding(params["layer_0"]["mlp"]["linear"].value)
 
-# IMPORTANT: we need a forward pass through the model with
-# - a mesh 
-# - logical axis rules
-# so that activation sharding constraints are applied during the forward pass
+
 def model_forward(params: dict[str, Any], cache: dict[str, Any], 
                   input: jax.Array, positions: jax.Array, 
                   attention_mask: jax.Array, 
@@ -182,10 +192,12 @@ def model_forward(params: dict[str, Any], cache: dict[str, Any],
   if isinstance(rules, dict):  
     rules = list(rules.items())
 
+  full_model = nnx.merge(transformer_graphdef, params)
   with mesh, nn.logical_axis_rules(rules):
-    return transformer.apply(params, input, positions, cache, attention_mask)
+    logits, cache = full_model(input, positions, cache, attention_mask)
+  return logits, nnx.state(cache)
 
-# prefill populates the cache
+
 @functools.partial(jax.jit, static_argnames=("config",), 
                    in_shardings=(params_sharding,  None))
 def prefill(params: dict[str, Any], input: jax.Array, 
@@ -194,16 +206,14 @@ def prefill(params: dict[str, Any], input: jax.Array,
   batch_size, input_len = input.shape
   max_len: int = config.max_cache_length
   positions, attention_mask = construct_positions_and_attn_mask(input, max_len)
-  dtype = jax.tree.flatten(params)[0][0].dtype
-  cache = jax.lax.with_sharding_constraint(
-    config.init_cache(batch_size, dtype=dtype), cache_sharding)
+  dtype = jax.tree.leaves(params)[0].dtype
+  cache = config.init_cache(batch_size, dtype=dtype)
+  cache = jax.lax.with_sharding_constraint(nnx.state(cache), cache_sharding)
   logits, cache = model_forward(params, cache, input, positions, attention_mask, 
                                 GLOBAL_MESH, GLOBAL_RULES)
   return logits, cache
 
 
-# Tokenization and right-alignement of sequences in batch
-# for efficient prefill + autoregressive decoding
 def id_from_str(text: str):
   tokens = vocab.Encode(text)
   assert len(tokens) == 1 and isinstance(tokens[0], int)
@@ -226,6 +236,8 @@ def right_align_sequences(inputs: list[str]) -> jax.Array:
 batch_input = right_align_sequences(["hello, how are you?", 
                                      "The weather today is"])
 
+logits, prefilled_cache = prefill(params, batch_input, config)
+
 # let's explore how right-aligned sequences have their mask generated
 input = jnp.asarray(batch_input, dtype=jnp.int32)
 positions, attn_mask = construct_positions_and_attn_mask(input, input.shape[-1])
@@ -234,8 +246,6 @@ print(f"Example batch_input =\n{batch_input}")
 print(f"Example positions =\n{positions}")
 print(f"Example attn_mask =\n{attn_mask * 1}")
 
-
-# The decoding step
 @functools.partial(jax.jit, static_argnames=("config", "max_len"), 
                    in_shardings=(params_sharding, cache_sharding, None))
 def decode(params: dict[str, Any], cache: dict[str, Any], input: jax.Array, 
@@ -275,8 +285,6 @@ def decode(params: dict[str, Any], cache: dict[str, Any], input: jax.Array,
   (new_tokens, _), _ = jax.lax.scan(_decode_step, (tokens, cache), autoreg_idxs)
   return new_tokens
 
-
-# test the actual model using prefill -> decode
 logits, prefilled_cache = prefill(params, batch_input, config)
 new_tokens = decode(params, prefilled_cache, batch_input, config, 128)
 

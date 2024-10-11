@@ -17,13 +17,21 @@
 import dataclasses
 import enum
 from typing import Iterable
+import logging
 
 from flax import linen as nn
+from flax import nnx
 from gemma import layers
 from gemma import modules
 from gemma import params as params_lib
 import jax
 import jax.numpy as jnp
+
+logger = logging.getLogger(__name__)
+if len(logger.handlers) == 0:
+  handler = logging.StreamHandler()
+  handler.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
+  logger.addHandler(handler)
 
 Cache = dict[str, modules.LayerCache]
 
@@ -231,7 +239,6 @@ class TransformerConfig:
       self,
       batch_size: int,
       dtype: jnp.dtype = jnp.bfloat16,
-      logically_partitioned: bool = False,
   ) -> Cache:
     """Initializes a new Transformer cache."""
     cache = {
@@ -241,45 +248,69 @@ class TransformerConfig:
             self.head_dim,
             batch_size,
             dtype,
-            logically_partitioned=logically_partitioned,
         )
         for i in range(self.num_layers)
     }
     return cache
 
 
-class Transformer(nn.Module):
+class Transformer(nnx.Module):
   """Gemma transformer."""
 
   config: TransformerConfig
 
-  def setup(self):
+  def __init__(self, config: TransformerConfig, rngs: nnx.Rngs | None = None):
+    if rngs is None:
+      logger.warning(
+        "You did not provide the rngs, setting rngs to nnx.Rngs(0)")
+      rngs = nnx.Rngs(0)
+    self.config = config
+
     self.embedder = modules.Embedder(
         vocab_size=self.config.num_embed,
         embed_dim=self.config.embed_dim,
+        rngs=rngs,
     )
 
-    self.blocks = [
-        modules.Block(
-            name=f'layer_{i}',
-            num_heads=self.config.num_heads,
-            num_kv_heads=self.config.num_kv_heads,
-            embed_dim=self.config.embed_dim,
-            head_dim=self.config.head_dim,
-            hidden_dim=self.config.hidden_dim,
-            sliding_window_size=self.config.sliding_window_size,
-            use_post_attn_norm=self.config.use_post_attn_norm,
-            use_post_ffw_norm=self.config.use_post_ffw_norm,
-            attn_logits_soft_cap=self.config.attn_logits_soft_cap,
-            attn_type=attn_type,
-            query_pre_attn_scalar=self.config.query_pre_attn_scalar(),
-            transpose_gating_einsum=self.config.transpose_gating_einsum,
-        )
-        for i, attn_type in zip(
-            range(self.config.num_layers), self.config.attention_types
-        )
-    ]
-    self.final_norm = layers.RMSNorm()
+    for i, attn_type in zip(range(self.config.num_layers), 
+                            self.config.attention_types):
+      setattr(self, f"layer_{i}", modules.Block(
+        name=f'layer_{i}', 
+        num_heads=self.config.num_heads, 
+        num_kv_heads=self.config.num_kv_heads, 
+        embed_dim=self.config.embed_dim, 
+        head_dim=self.config.head_dim, 
+        hidden_dim=self.config.hidden_dim, 
+        sliding_window_size=self.config.sliding_window_size, 
+        use_post_attn_norm=self.config.use_post_attn_norm, 
+        use_post_ffw_norm=self.config.use_post_ffw_norm, 
+        attn_logits_soft_cap=self.config.attn_logits_soft_cap, 
+        attn_type=attn_type, 
+        query_pre_attn_scalar=self.config.query_pre_attn_scalar(), 
+        transpose_gating_einsum=self.config.transpose_gating_einsum, 
+        rngs=rngs))
+    #self.blocks = [
+    #    modules.Block(
+    #        name=f'layer_{i}',
+    #        num_heads=self.config.num_heads,
+    #        num_kv_heads=self.config.num_kv_heads,
+    #        embed_dim=self.config.embed_dim,
+    #        head_dim=self.config.head_dim,
+    #        hidden_dim=self.config.hidden_dim,
+    #        sliding_window_size=self.config.sliding_window_size,
+    #        use_post_attn_norm=self.config.use_post_attn_norm,
+    #        use_post_ffw_norm=self.config.use_post_ffw_norm,
+    #        attn_logits_soft_cap=self.config.attn_logits_soft_cap,
+    #        attn_type=attn_type,
+    #        query_pre_attn_scalar=self.config.query_pre_attn_scalar(),
+    #        transpose_gating_einsum=self.config.transpose_gating_einsum,
+    #        rngs=rngs,
+    #    )
+    #    for i, attn_type in zip(
+    #        range(self.config.num_layers), self.config.attention_types
+    #    )
+    #]
+    self.final_norm = layers.RMSNorm(self.config.embed_dim)
 
   def __call__(
       self,
@@ -306,10 +337,11 @@ class Transformer(nn.Module):
       new_cache: updated cache if the input cache is not None, None elsewhere.
     """
     x = self.embedder.encode(last_tokens)
-    for i, block in enumerate(self.blocks):
+    #for i, block in enumerate(self.blocks):
+    for i in range(self.config.num_layers):
       layer_name = f'layer_{i}'
       layer_cache = cache[layer_name] if cache else None
-      layer_cache, x = block(
+      layer_cache, x = getattr(self, layer_name)(
           x,
           positions,
           layer_cache,

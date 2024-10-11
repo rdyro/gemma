@@ -15,32 +15,28 @@
 """Base layers."""
 
 from flax import linen as nn
+from flax import nnx
 import jax
 import jax.numpy as jnp
 
 
-class Einsum(nn.Module):
+class Einsum(nnx.Module):
   """Einsum is a convenience module for parameterized tensor multiplication."""
-  shape: tuple[int, ...]
-  axis_names: list[str]
-  
-  def setup(self):
-    weight_init_fn = nn.with_logical_partitioning(nn.initializers.normal(), 
-                                                  self.axis_names)
-    self.w = self.param('w', weight_init_fn, self.shape)
+  def __init__(self, shape: tuple[int, ...], axis_names: list[str], 
+               rngs: nnx.Rngs):
+    self.w = nnx.Param(nnx.initializers.normal()(rngs(), shape), 
+                       names=axis_names)
 
   def __call__(self, eqn: str, x: jax.Array) -> jax.Array:
-    return jnp.einsum(eqn, x, self.w)
+    return jnp.einsum(eqn, x, self.w.value)
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(nnx.Module):
   """RMSNorm layer."""
+  def __init__(self, features: int):
+    self.scale = nnx.Param(jnp.zeros((features,)), names=("features",))
 
-  @nn.compact
   def __call__(self, x):
-    scale_init = nn.with_logical_partitioning(nn.initializers.zeros_init(), 
-                                              ("features",))
-    scale = self.param('scale', scale_init, (x.shape[-1]))
     var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
 
     # Jax.lax.rsqrt is used because it returns different floats than
@@ -50,6 +46,6 @@ class RMSNorm(nn.Module):
     # normed_inputs is a rank-K tensor, K > 1 (K is typically 2 or 3). scale is
     # a rank-1 tensor. To avoid implicit rank-promotion, reshape scale to
     # a (1, ..., 1, D) tensor, so the rank of scale matches normed_inputs.
-    scale = jnp.expand_dims(scale, axis=range(len(x.shape) - 1))
+    scale = jnp.expand_dims(self.scale.value, axis=range(len(x.shape) - 1))
     normed_inputs = normed_inputs * (1 + scale)
     return normed_inputs
