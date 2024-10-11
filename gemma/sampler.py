@@ -28,6 +28,8 @@ import jax.numpy as jnp
 
 import sentencepiece as spm
 
+raise NotImplementedError
+
 
 def _compute_attention_masks(
     time_step: jax.Array, seq_len: int, input_mask: jax.Array

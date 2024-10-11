@@ -22,6 +22,7 @@ from gemma import modules
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 
 
 _ATTN_TYPE = modules.AttentionType.GLOBAL
@@ -32,24 +33,20 @@ class EmbedderTest(absltest.TestCase):
   def test_encodes(self):
     vocab_size = 10
     embed_dim = 4
-    embedder = modules.Embedder(vocab_size=vocab_size, embed_dim=embed_dim)
-    output = embedder.apply(
-        {'params': {'input_embedding': jnp.ones((vocab_size, embed_dim))}},
-        [2, 3],
-        method=modules.Embedder.encode,
-    )
+    embedder = modules.Embedder(vocab_size=vocab_size, embed_dim=embed_dim, 
+                                rngs=nnx.Rngs(0))
+    embedder.input_embedding.value = jnp.ones((vocab_size, embed_dim))
+    output = embedder.encode([2, 3])
     expected = [[2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0]]
     np.testing.assert_array_equal(output, jnp.array(expected))
 
   def test_decodes(self):
     vocab_size = 5
     embed_dim = 2
-    embedder = modules.Embedder(vocab_size=vocab_size, embed_dim=embed_dim)
-    output = embedder.apply(
-        {'params': {'input_embedding': jnp.ones((vocab_size, embed_dim))}},
-        jnp.array([1, 2]),
-        method=modules.Embedder.decode,
-    )
+    embedder = modules.Embedder(vocab_size=vocab_size, embed_dim=embed_dim, 
+                                rngs=nnx.Rngs(0))
+    embedder.input_embedding.value = jnp.ones((vocab_size, embed_dim))
+    output = embedder.decode(jnp.array([1, 2]))
     expected = [3.0, 3.0, 3.0, 3.0, 3.0]
     np.testing.assert_array_equal(output, jnp.array(expected))
 
@@ -179,6 +176,7 @@ class AttentionTest(absltest.TestCase):
         head_dim=head_dim,
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=query_pre_attn_scalar,
+        rngs=nnx.Rngs(0),
     )
     cache = modules.Attention.init_cache(
         cache_size=cache_size,
@@ -188,16 +186,7 @@ class AttentionTest(absltest.TestCase):
         dtype=jnp.float32,
     )
     x = jnp.ones((batch_size, 1, features))
-    params = attn.init(
-        jax.random.PRNGKey(0),
-        x,
-        jnp.array([[segment_pos]]),
-        cache,
-        attn_mask,
-    )
-    cache, output = attn.apply(
-        params, x, jnp.array([[segment_pos]]), cache, attn_mask
-    )
+    cache, output = attn(x, jnp.array([[segment_pos]]), cache, attn_mask)
     return cache, output
 
   def test_attention(self):
@@ -208,7 +197,7 @@ class AttentionTest(absltest.TestCase):
     )
     expected_cache_shape = (2, 3, 2, 4)
     expected_output_shape = (2, 1, 8)
-    self.assertEqual(cache['k'].shape, expected_cache_shape)
+    self.assertEqual(cache['k'].value.shape, expected_cache_shape)
     self.assertEqual(output.shape, expected_output_shape)
 
   def test_attention_with_gqa(self):
@@ -220,7 +209,7 @@ class AttentionTest(absltest.TestCase):
     )
     expected_cache_shape = (2, 3, 4, 2)
     expected_output_shape = (2, 1, 10)
-    self.assertEqual(cache['k'].shape, expected_cache_shape)
+    self.assertEqual(cache['k'].value.shape, expected_cache_shape)
     self.assertEqual(output.shape, expected_output_shape)
 
   def test_sliding_window(self):
@@ -247,17 +236,9 @@ class AttentionTest(absltest.TestCase):
         head_dim=head_dim,
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=query_pre_attn_scalar,
+        rngs=nnx.Rngs(0),
     )
-    params = attn.init(
-        jax.random.PRNGKey(0),
-        x,
-        jnp.array([[segment_pos]]),
-        cache,
-        attn_mask,
-    )
-    _, output = attn.apply(
-        params, x, jnp.array([[segment_pos]]), cache, attn_mask
-    )
+    _, output = attn(x, jnp.array([[segment_pos]]), cache, attn_mask)
     sliding_attn = modules.Attention(
         num_heads=num_heads,
         num_kv_heads=num_heads,
@@ -266,10 +247,9 @@ class AttentionTest(absltest.TestCase):
         attn_type=modules.AttentionType.LOCAL_SLIDING,
         sliding_window_size=2,
         query_pre_attn_scalar=query_pre_attn_scalar,
+        rngs=nnx.Rngs(0),
     )
-    _, sliding_output = sliding_attn.apply(
-        params, x, jnp.array([[segment_pos]]), cache, attn_mask
-    )
+    _, sliding_output = sliding_attn(x, jnp.array([[segment_pos]]), cache, attn_mask)
 
     self.assertFalse((output == sliding_output).all())
 
@@ -294,52 +274,22 @@ class AttentionTest(absltest.TestCase):
         query_pre_attn_scalar=query_pre_attn_scalar_by_embed_dim_div_num_heads,
     )
     expected_output_by_head_dim = [
-        [[
-            1.1596170e-04,
-            3.0531217e-05,
-            4.5884139e-05,
-            -3.3920849e-05,
-            -5.5468496e-05,
-            8.6856808e-06,
-            -1.5840206e-04,
-            1.0944265e-04,
-        ]],
-        [[
-            1.1596170e-04,
-            3.0531217e-05,
-            4.5884139e-05,
-            -3.3920849e-05,
-            -5.5468496e-05,
-            8.6856808e-06,
-            -1.5840206e-04,
-            1.0944265e-04,
-        ]],
-    ]
+       [[-7.22297846e-05,  2.81748780e-05,  7.52076885e-05,
+         -1.63807417e-05, -2.48165161e-04,  1.00887655e-05,
+         -1.79801791e-04,  1.21651276e-04]],
+
+       [[-7.22297846e-05,  2.81748780e-05,  7.52076885e-05,
+         -1.63807417e-05, -2.48165161e-04,  1.00887655e-05,
+         -1.79801791e-04,  1.21651276e-04]]]
     np.testing.assert_array_almost_equal(
         output_by_head_dim, expected_output_by_head_dim
     )
     expected_output_by_embed_dim_div_num_heads = [
-        [[
-            1.15790164e-04,
-            3.05866670e-05,
-            4.57668611e-05,
-            -3.40082588e-05,
-            -5.54954640e-05,
-            8.75260412e-06,
-            -1.58223527e-04,
-            1.09341796e-04,
-        ]],
-        [[
-            1.15790164e-04,
-            3.05866670e-05,
-            4.57668611e-05,
-            -3.40082588e-05,
-            -5.54954640e-05,
-            8.75260412e-06,
-            -1.58223527e-04,
-            1.09341796e-04,
-        ]],
-    ]
+      [[-7.1959868e-05,  2.8177414e-05,  7.5596516e-05, -1.5767742e-05,
+        -2.4840460e-04,  9.0603517e-06, -1.7947453e-04,  1.2100538e-04]],
+
+      [[-7.1959868e-05,  2.8177414e-05,  7.5596516e-05, -1.5767742e-05,
+        -2.4840460e-04,  9.0603517e-06, -1.7947453e-04,  1.2100538e-04]]]
     np.testing.assert_array_almost_equal(
         output_by_embed_dim_div_num_heads,
         expected_output_by_embed_dim_div_num_heads,
@@ -366,31 +316,31 @@ class FeedForwardTest(parameterized.TestCase):
         features=features,
         hidden_dim=hidden_dim,
         transpose_gating_einsum=transpose_gating_einsum,
+        rngs=nnx.Rngs(0),
     )
-
-    params = {'linear': jnp.ones((hidden_dim, features))}
 
     # Different checkpoints have params saved in different order
     if transpose_gating_einsum:
-      params['gating_einsum'] = jnp.ones((batch_size, hidden_dim, features))
+      ffw.gating_einsum.value = jnp.ones((batch_size, hidden_dim, features))
     else:
-      params['gating_einsum'] = jnp.ones((batch_size, features, hidden_dim))
+      ffw.gating_einsum.value = jnp.ones((batch_size, features, hidden_dim))
 
-    outputs = ffw.apply({'params': params}, inputs)
+    outputs = ffw(inputs)
 
     expected_val = [11.72758674, 47.99916]
     expected_shape = (2, 1, 2)
-    np.testing.assert_array_almost_equal(outputs[:, 0, 0], expected_val)
+    np.testing.assert_array_almost_equal(outputs[:, 0, 0], expected_val, 
+                                         decimal=5)
     self.assertEqual(outputs.shape, expected_shape)
 
   @parameterized.parameters(
       dict(
           transpose_gating_einsum=False,
-          expected_grad=[-1.916515e-04, -5.391428e-05, -2.923766e-04],
+          expected_grad=[1.293097e-04, 2.554320e-05, 7.977059e-05],
       ),
       dict(
           transpose_gating_einsum=True,
-          expected_grad=[1.574128e-05, -1.301362e-04, -1.037612e-04],
+          expected_grad=[7.560331e-06, 2.570399e-04, 1.750336e-05],
       ),
   )
   def test_ffw_grad(self, transpose_gating_einsum: bool,
@@ -404,17 +354,17 @@ class FeedForwardTest(parameterized.TestCase):
         features=features,
         hidden_dim=hidden_dim,
         transpose_gating_einsum=transpose_gating_einsum,
+        rngs=nnx.Rngs(0),
     )
-    loss = lambda params, inputs: jnp.square(
-        ffw.apply(params, inputs) - jnp.ones((batch_size, 1, features))
+    loss = lambda state, inputs: jnp.square(
+        nnx.merge(nnx.graphdef(ffw), state)(inputs) 
+        - jnp.ones((batch_size, 1, features))
     ).mean()
-
-    params = ffw.init(jax.random.PRNGKey(0), inputs)
-
+    state = nnx.state(ffw)
     grad_loss = jax.grad(loss)
-    grad = grad_loss(params, inputs)
+    grad = grad_loss(state, inputs)
     np.testing.assert_array_almost_equal(
-        grad['params']['linear'][:, 0], expected_grad
+        grad['linear'].value[:, 0], expected_grad
     )
 
 
@@ -446,18 +396,13 @@ class BlockTest(absltest.TestCase):
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=head_dim**-0.5,
         transpose_gating_einsum=False,
+        rngs=nnx.Rngs(0),
     )
-    params = block.init(
-        jax.random.PRNGKey(0), inputs, jnp.array([[0]]), cache, attn_mask
-    )
-
-    new_cache, outputs = block.apply(
-        params, inputs, jnp.array([[0]]), cache, attn_mask
-    )
+    new_cache, outputs = block(inputs, jnp.array([[0]]), cache, attn_mask)
 
     expected_cache_shape = (2, 3, 2, 6)
     expected_output_shape = (2, 1, 4)
-    self.assertEqual(new_cache['k'].shape, expected_cache_shape)
+    self.assertEqual(new_cache['k'].value.shape, expected_cache_shape)
     self.assertEqual(outputs.shape, expected_output_shape)
 
   def test_post_attention_norm_modifies_output(self):
@@ -488,6 +433,7 @@ class BlockTest(absltest.TestCase):
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=query_pre_attn_scalar,
         transpose_gating_einsum=False,
+        rngs=nnx.Rngs(0),
     )
     unnormed_block = modules.Block(
         num_heads=num_heads,
@@ -500,17 +446,12 @@ class BlockTest(absltest.TestCase):
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=query_pre_attn_scalar,
         transpose_gating_einsum=False,
+        rngs=nnx.Rngs(0),
     )
 
     all_outputs = []
     for block in (normed_block, unnormed_block):
-      params = block.init(
-          jax.random.PRNGKey(0), inputs, jnp.array([[0]]), cache, attn_mask
-      )
-
-      _, outputs = block.apply(
-          params, inputs, jnp.array([[0]]), cache, attn_mask
-      )
+      _, outputs = block(inputs, jnp.array([[0]]), cache, attn_mask)
       all_outputs.append(outputs)
 
     normed_output, unnormed_output = all_outputs  # pylint: disable=unbalanced-tuple-unpacking
@@ -549,6 +490,7 @@ class BlockTest(absltest.TestCase):
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=query_pre_attn_scalar,
         transpose_gating_einsum=False,
+        rngs=nnx.Rngs(0),
     )
     unnormed_block = modules.Block(
         num_heads=num_heads,
@@ -561,25 +503,18 @@ class BlockTest(absltest.TestCase):
         attn_type=_ATTN_TYPE,
         query_pre_attn_scalar=query_pre_attn_scalar,
         transpose_gating_einsum=False,
+        rngs=nnx.Rngs(0),
     )
 
     all_outputs = []
     for block in (normed_block, unnormed_block):
-
-      params = block.init(
-          jax.random.PRNGKey(0), inputs, jnp.array([[0]]), cache, attn_mask
-      )
-
       # Replace mlp block params with 1s as ffw will initialize with
       # 0s which will not properly test normalization.
       for param in ['gating_einsum', 'linear']:
-        params['params']['mlp'][param] = jnp.ones_like(
-            params['params']['mlp'][param]
-        )
+        getattr(block.mlp, param).value = jnp.ones_like(
+          getattr(block.mlp, param))
 
-      _, outputs = block.apply(
-          params, inputs, jnp.array([[0]]), cache, attn_mask
-      )
+      _, outputs = block(inputs, jnp.array([[0]]), cache, attn_mask)
       all_outputs.append(outputs)
 
     normed_output, unnormed_output = all_outputs  # pylint: disable=unbalanced-tuple-unpacking

@@ -22,8 +22,9 @@ import jax.numpy as jnp
 
 class Einsum(nnx.Module):
   """Einsum is a convenience module for parameterized tensor multiplication."""
-  def __init__(self, shape: tuple[int, ...], axis_names: list[str], 
-               rngs: nnx.Rngs):
+  def __init__(self, shape: tuple[int, ...], axis_names: list[str] | None = None, 
+               rngs: nnx.Rngs | None = None):
+    assert rngs is not None
     self.w = nnx.Param(nnx.initializers.normal()(rngs(), shape), 
                        names=axis_names)
 

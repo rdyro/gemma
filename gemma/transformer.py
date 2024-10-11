@@ -275,7 +275,6 @@ class Transformer(nnx.Module):
     for i, attn_type in zip(range(self.config.num_layers), 
                             self.config.attention_types):
       setattr(self, f"layer_{i}", modules.Block(
-        name=f'layer_{i}', 
         num_heads=self.config.num_heads, 
         num_kv_heads=self.config.num_kv_heads, 
         embed_dim=self.config.embed_dim, 
@@ -289,27 +288,6 @@ class Transformer(nnx.Module):
         query_pre_attn_scalar=self.config.query_pre_attn_scalar(), 
         transpose_gating_einsum=self.config.transpose_gating_einsum, 
         rngs=rngs))
-    #self.blocks = [
-    #    modules.Block(
-    #        name=f'layer_{i}',
-    #        num_heads=self.config.num_heads,
-    #        num_kv_heads=self.config.num_kv_heads,
-    #        embed_dim=self.config.embed_dim,
-    #        head_dim=self.config.head_dim,
-    #        hidden_dim=self.config.hidden_dim,
-    #        sliding_window_size=self.config.sliding_window_size,
-    #        use_post_attn_norm=self.config.use_post_attn_norm,
-    #        use_post_ffw_norm=self.config.use_post_ffw_norm,
-    #        attn_logits_soft_cap=self.config.attn_logits_soft_cap,
-    #        attn_type=attn_type,
-    #        query_pre_attn_scalar=self.config.query_pre_attn_scalar(),
-    #        transpose_gating_einsum=self.config.transpose_gating_einsum,
-    #        rngs=rngs,
-    #    )
-    #    for i, attn_type in zip(
-    #        range(self.config.num_layers), self.config.attention_types
-    #    )
-    #]
     self.final_norm = layers.RMSNorm(self.config.embed_dim)
 
   def __call__(

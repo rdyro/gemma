@@ -255,25 +255,27 @@ class FeedForward(nnx.Module):
     self.hidden_dim = hidden_dim
     self.transpose_gating_einsum = transpose_gating_einsum
     if self.transpose_gating_einsum:
-      gating_einsum = nnx.Param(
+      self.gating_einsum = nnx.Param(
         nnx.initializers.normal()(rngs(), (2, self.hidden_dim, self.features)), 
-        names=(None, "ffw", "features"))
-      self.gating_einsum = gating_einsum.transpose((0, 2, 1))
+        names=(None, "features", "ffw"))
     else:
       self.gating_einsum = nnx.Param(
         nnx.initializers.normal()(rngs(), (2, self.features, self.hidden_dim)), 
         names=(None, "ffw", "features"))
     self.linear = nnx.Param(
-      jnp.zeros((self.hidden_dim, self.features)), names=("ffw", "features"))
+      jnp.ones((self.hidden_dim, self.features)), names=("ffw", "features"))
     
   def __call__(self, x):
     # Some versions use an alternate parameter ordering that
     # transposes hidden_dim and features.
-    ff_gate = jnp.dot(x, self.gating_einsum.value[0])
+    gating_einsum_w = self.gating_einsum.value
+    if self.transpose_gating_einsum:
+      gating_einsum_w = gating_einsum_w.transpose((0, 2, 1))
+    ff_gate = jnp.dot(x, gating_einsum_w[0])
     gate_value = nn.gelu(ff_gate)
 
     # Up projection
-    ff1 = jnp.dot(x, self.gating_einsum.value[1])
+    ff1 = jnp.dot(x, gating_einsum_w[1])
     activations = gate_value * ff1
 
     # Down projection
@@ -286,7 +288,6 @@ class FeedForward(nnx.Module):
 class Block(nnx.Module):
   """Transformer block."""
 
-  name: str
   num_heads: int
   num_kv_heads: int
   embed_dim: int

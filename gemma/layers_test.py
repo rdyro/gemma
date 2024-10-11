@@ -16,10 +16,12 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
-from gemma import layers
-import jax
+
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
+
+from gemma import layers
 
 
 class EinsumTest(parameterized.TestCase):
@@ -39,20 +41,16 @@ class EinsumTest(parameterized.TestCase):
       ),
   )
   def test_einsum(self, inputs_shape, params_shape, eqn, expected_shape):
-    einsum = layers.Einsum(params_shape)
-    output = einsum.apply(
-        {'params': {'w': jnp.ones(params_shape)}},
-        eqn,
-        jnp.ones(inputs_shape),
-    )
+    einsum = layers.Einsum(params_shape, rngs=nnx.Rngs(0))
+    einsum.w.value = jnp.ones(params_shape)
+    output = einsum(eqn, jnp.ones(inputs_shape))
     self.assertEqual(output.shape, expected_shape)
 
   @parameterized.parameters(dict(x=[0.1, 0.2], expected=[0.6324429, 1.2648858]))
   def test_rmsnorm(self, x, expected):
     x = jnp.array([x])
-    rmsnorm = layers.RMSNorm()
-    params = rmsnorm.init(jax.random.PRNGKey(0), x)
-    output = rmsnorm.apply(params, x)
+    rmsnorm = layers.RMSNorm(x.shape[-1])
+    output = rmsnorm(x)
     np.testing.assert_array_equal(output, jnp.array([expected]))
 
 

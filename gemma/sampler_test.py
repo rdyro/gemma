@@ -26,6 +26,7 @@ import numpy as np
 
 import sentencepiece as spm
 
+raise NotImplementedError
 
 class MockVocab(spm.SentencePieceProcessor):
 

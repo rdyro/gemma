@@ -137,16 +137,7 @@ class TransformerTest(parameterized.TestCase):
     attention_mask = jnp.ones((batch_size, 1, cache_size), dtype=jnp.bool)
     with jax.numpy_rank_promotion('raise'):
       transformer = transformer_lib.Transformer(config=config)
-      params = transformer.init(
-          jax.random.PRNGKey(0),
-          last_tokens=jnp.tile(jnp.arange(sequence_length), (batch_size, 1)),
-          positions=jnp.tile(jnp.arange(sequence_length), (batch_size, 1)),
-          cache=cache,
-          attention_mask=attention_mask,
-      )
-
-      outputs, cache = transformer.apply(
-          params,
+      outputs, cache = transformer(
           jnp.tile(jnp.arange(sequence_length), (batch_size, 1)),
           jnp.tile(jnp.arange(sequence_length), (batch_size, 1)),
           cache,
@@ -205,17 +196,8 @@ class TransformerTest(parameterized.TestCase):
       with jax.numpy_rank_promotion('raise'):
         cache = config.init_cache(batch_size, dtype=jnp.float32)
         transformer = transformer_lib.Transformer(config=config)
-
-        params = transformer.init(
-            jax.random.PRNGKey(0),
-            last_tokens=jnp.tile(jnp.arange(sequence_length), (batch_size, 1)),
-            positions=jnp.array([[1]]),
-            cache=cache,
-            attention_mask=attention_mask,
-        )
-
-        outputs, _ = transformer.apply(
-            params, jnp.array([[1]]), jnp.array([[1]]), cache, attention_mask
+        outputs, _ = transformer(
+          jnp.array([[1]]), jnp.array([[1]]), cache, attention_mask
         )
         all_outputs.append(outputs)
 
@@ -293,23 +275,16 @@ class TransformerTest(parameterized.TestCase):
           (batch_size, seq_size, config.max_cache_length), dtype=jnp.bool
       )
       positions = transformer_lib.build_positions_from_mask(token_input != 0)
-      params = transformer.init(
-          jax.random.PRNGKey(0),
-          token_input,
-          positions,
-          empty_cache,
-          attention_mask,
-      )
 
-      output_cache, _ = transformer.apply(
-          params, token_input, positions, empty_cache, attention_mask
+      output_cache, _ = transformer(
+          token_input, positions, empty_cache, attention_mask
       )
 
       attention_mask = jnp.ones(
           (batch_size, seq_size, seq_size), dtype=jnp.bool
       )
-      output_none, cache_none = transformer.apply(
-          params, token_input, positions, None, attention_mask
+      output_none, cache_none = transformer(
+          token_input, positions, None, attention_mask
       )
 
       self.assertIsNone(cache_none)
