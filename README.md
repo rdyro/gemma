@@ -1,8 +1,7 @@
-# Recent Revisions
+# Gemma in NNX with Sharding 
 
-- model parameters now wrapped in "flax.linen.LogicallyPartitioned" for 
-partitioning using logical axes names
-- new quickstart for sharded model loading and batched autoregressive decoding: [sharded_model_quickstart.ipynb](./sharded_model_quickstart.ipynb)
+- model parameters now implemented in [NNX](https://flax.readthedocs.io/en/)!
+- new quickstart for sharded model loading and batched autoregressive decoding: [sampling_with_sharding.ipynb](./colabs/sampling_with_sharding.ipynb)
 
 ---
 

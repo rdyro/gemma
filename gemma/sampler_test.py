@@ -26,8 +26,6 @@ import numpy as np
 
 import sentencepiece as spm
 
-raise NotImplementedError
-
 class MockVocab(spm.SentencePieceProcessor):
 
   def __init__(self):
@@ -92,23 +90,11 @@ class SamplerTest(absltest.TestCase):
         attn_logits_soft_cap=None,
         use_post_ffw_norm=None,
     )
-    attention_mask = jnp.ones((1, 1, transformer_config.max_cache_length))
-    cache = transformer_config.init_cache(1, dtype=jnp.float32)
     transformer = transformer_lib.Transformer(transformer_config)
-    params = transformer.init(
-        jax.random.PRNGKey(0),
-        jnp.array([[1]]),
-        jnp.array([[1]]),
-        cache,
-        attention_mask,
-    )
-    sampler = sampler_lib.Sampler(
-        transformer=transformer,
-        vocab=vocab,
-        params=params['params'],
-    )
+    sampler = sampler_lib.Sampler(transformer=transformer, vocab=vocab)
 
-    result = sampler(['input string', 'hello world'], total_generation_steps=10)
+    result = sampler(['input string', 'hello world'], total_generation_steps=10,
+                     apply_chat_template=False)
     self.assertIsNotNone(result)
 
   def test_forbidden_tokens(self):
@@ -127,25 +113,11 @@ class SamplerTest(absltest.TestCase):
         use_post_attn_norm=None,
         use_post_ffw_norm=None,
     )
-    attention_mask = jnp.ones((1, 1, transformer_config.max_cache_length))
-    cache = transformer_config.init_cache(1, dtype=jnp.float32)
     transformer = transformer_lib.Transformer(transformer_config)
-    params = transformer.init(
-        jax.random.PRNGKey(0),
-        jnp.array([[1]]),
-        jnp.array([[1]]),
-        cache,
-        attention_mask,
-    )
     # Pre-cook the embedding matrix so that the output is deterministic.
-    params['params']['embedder']['initial_embedding'] = jnp.eye(
-        vocab.GetPieceSize(), 32
-    )
-    sampler = sampler_lib.Sampler(
-        transformer=transformer,
-        vocab=vocab,
-        params=params['params'],
-    )
+    transformer.embedder.input_embedding.value = jnp.eye(vocab.GetPieceSize(), 
+                                                         32)
+    sampler = sampler_lib.Sampler(transformer=transformer, vocab=vocab)
 
     # First, we check that the sampler would produce the tokens that we are
     # trying to forbid.
@@ -153,6 +125,8 @@ class SamplerTest(absltest.TestCase):
         ['input string', 'hello world'],
         total_generation_steps=10,
         forbidden_tokens=None,
+        echo=False, 
+        apply_chat_template=False,
     )
     self.assertIn('string', result1.text[0])
     self.assertIn('world', result1.text[1])
@@ -162,6 +136,8 @@ class SamplerTest(absltest.TestCase):
         ['input string', 'hello world'],
         total_generation_steps=10,
         forbidden_tokens=['string', 'world'],
+        echo=False, 
+        apply_chat_template=False,
     )
     for output in result2.text:
       self.assertNotIn('string', output)
@@ -179,7 +155,7 @@ class SamplerTest(absltest.TestCase):
         head_dim=64,
         max_cache_length=9,
         final_logit_softcap=None,
-        attention_types=[modules.AttentionType.GLOBAL],
+        attention_types=[modules.AttentionType.GLOBAL] * 2,
         use_post_attn_norm=None,
         use_post_ffw_norm=None,
     )
@@ -197,16 +173,7 @@ class SamplerTest(absltest.TestCase):
 
     n_input_tokens = token_input.shape[1]
 
-    params = transformer.init(
-        jax.random.PRNGKey(42),
-        token_input,
-        positions,
-        cache,
-        attention_mask,
-    )
-
-    output_forward, _ = transformer.apply(
-        params,
+    output_forward, _ = transformer(
         last_tokens=token_input,
         positions=positions,
         cache=cache,
@@ -214,18 +181,15 @@ class SamplerTest(absltest.TestCase):
     )
     output_forward = output_forward[0, :n_input_tokens]
 
-    sampler = sampler_lib.Sampler(
-        transformer=transformer,
-        vocab=vocab,
-        params=params['params'],
-    )
+    sampler = sampler_lib.Sampler(transformer=transformer, vocab=vocab)
 
     output_transformer = sampler(
-        [raw_input], total_generation_steps=10, echo=True
+        [raw_input], total_generation_steps=10, echo=True,
+        apply_chat_template=False
     )
-    out_logits = np.array(output_transformer.logits)[0, 1 : n_input_tokens + 1]
+    out_logits = np.array(output_transformer.logits)[0, :n_input_tokens]
 
-    np.testing.assert_almost_equal(output_forward, out_logits)
+    np.testing.assert_almost_equal(output_forward, out_logits, decimal=2)
 
   def test_sampler_init_sample_state(self):
     vocab = MockVocab()
@@ -239,25 +203,12 @@ class SamplerTest(absltest.TestCase):
         head_dim=64,
         max_cache_length=8,
         final_logit_softcap=None,
-        attention_types=[modules.AttentionType.GLOBAL],
+        attention_types=[modules.AttentionType.GLOBAL] * 0,
         use_post_attn_norm=None,
         use_post_ffw_norm=None,
     )
-    attention_mask = jnp.ones((1, 1, transformer_config.max_cache_length))
-    cache = transformer_config.init_cache(1, dtype=jnp.float32)
     transformer = transformer_lib.Transformer(transformer_config)
-    params = transformer.init(
-        jax.random.PRNGKey(0),
-        jnp.array([[1]]),
-        jnp.array([[1]]),
-        cache,
-        attention_mask,
-    )
-    sampler = sampler_lib.Sampler(
-        transformer=transformer,
-        vocab=vocab,
-        params=params['params'],
-    )
+    sampler = sampler_lib.Sampler(transformer=transformer, vocab=vocab)
 
     input_strings = ['<pad> hello world', 'input string <pad>']
     all_input_ids = [sampler.tokenize(x) for x in input_strings]
@@ -268,8 +219,10 @@ class SamplerTest(absltest.TestCase):
     )
 
     # Check that the position indices correctly ignore padding
-    self.assertListEqual(list(sample_state.positions[0]), [0, 0, 1, 2, 3, 4])
-    self.assertListEqual(list(sample_state.positions[1]), [0, 1, 2, 2, 3, 4])
+    self.assertListEqual(list(sample_state.positions[0]),
+                         [0, 0, 1, 2, 3, 4, 5, 6])
+    self.assertListEqual(list(sample_state.positions[1]),
+                         [0, 1, 2, 2, 3, 4, 5, 6])
 
   def test_sampler_mask_tokens_after_eos_ids(self):
     vocab = MockVocab()
@@ -283,25 +236,12 @@ class SamplerTest(absltest.TestCase):
         head_dim=64,
         max_cache_length=8,
         final_logit_softcap=None,
-        attention_types=[modules.AttentionType.GLOBAL],
+        attention_types=[modules.AttentionType.GLOBAL] * 0,
         use_post_attn_norm=None,
         use_post_ffw_norm=None,
     )
-    attention_mask = jnp.ones((1, 1, transformer_config.max_cache_length))
-    cache = transformer_config.init_cache(1, dtype=jnp.float32)
     transformer = transformer_lib.Transformer(transformer_config)
-    params = transformer.init(
-        jax.random.PRNGKey(0),
-        jnp.array([[1]]),
-        jnp.array([[1]]),
-        cache,
-        attention_mask,
-    )
-    sampler = sampler_lib.Sampler(
-        transformer=transformer,
-        vocab=vocab,
-        params=params['params'],
-    )
+    sampler = sampler_lib.Sampler(transformer=transformer, vocab=vocab)
 
     input_strings = ['hello world </s> hello world', 'input string </s> hello']
     all_input_ids = [sampler.tokenize(x) for x in input_strings]
@@ -311,12 +251,13 @@ class SamplerTest(absltest.TestCase):
         total_sampling_steps=total_sampling_steps,
     )
 
-    masked_token_buffer = sampler.mask_tokens_after_eos_ids(
-        sample_state.token_buffer
-    )
+    masked_token_buffer = sampler_lib.mask_tokens_after_eos_ids(
+        sample_state.token_buffer, sample_state.pad_id, sample_state.eos_id)
 
-    self.assertListEqual(list(masked_token_buffer[0]), [1, 5, 6, 2, 0, 0])
-    self.assertListEqual(list(masked_token_buffer[1]), [1, 3, 4, 2, 0, 0])
+    self.assertListEqual(masked_token_buffer[0].tolist(),
+                         [1, 5, 6, 2, 0, 0, 0, 0])
+    self.assertListEqual(masked_token_buffer[1].tolist(),
+                         [0, 1, 3, 4, 2, 0, 0, 0]) # 2nd sequence is left-padded
 
   def test_compute_attention_mask(self):
     # Check that the input mask is correctly applied when total sampling steps

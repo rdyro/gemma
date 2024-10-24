@@ -26,6 +26,7 @@ from gemma import modules
 from gemma import params as params_lib
 import jax
 import jax.numpy as jnp
+from jax.util import safe_zip
 
 logger = logging.getLogger(__name__)
 if len(logger.handlers) == 0:
@@ -272,8 +273,8 @@ class Transformer(nnx.Module):
         rngs=rngs,
     )
 
-    for i, attn_type in zip(range(self.config.num_layers), 
-                            self.config.attention_types):
+    for i, attn_type in safe_zip(range(self.config.num_layers), 
+                                 self.config.attention_types):
       setattr(self, f"layer_{i}", modules.Block(
         num_heads=self.config.num_heads, 
         num_kv_heads=self.config.num_kv_heads, 

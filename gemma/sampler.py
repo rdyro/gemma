@@ -20,84 +20,33 @@ from collections.abc import Sequence
 import dataclasses
 import math
 import functools
+import logging
+import time
 
 import chex
 from gemma import modules
-from gemma import params as params_lib
 from gemma import transformer as transformer_lib
 from flax import nnx
+from flax.linen import logical_axis_rules, logical_to_mesh_sharding
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.sharding import Mesh, PartitionSpec as P
 
 import sentencepiece as spm
 
+logger = logging.getLogger(__name__)
+logger.setLevel("DEBUG")
 
+# we'll pad static dimensions to the nearest power of two to limit recompilation
 next_power_of_two = lambda i: 2 ** math.ceil(math.log2(i))
 
-def _compute_attention_masks(
-    time_step: jax.Array, seq_len: int, input_mask: jax.Array
-) -> jax.Array:
-  """Computes causal attention mask."""
-  bsz = input_mask.shape[0]
-  batch_time_step = jnp.full((bsz, 1), time_step, dtype=jnp.uint32)
-  causal_mask = jnp.less_equal(
-      jnp.expand_dims(jnp.arange(seq_len), 0), batch_time_step
-  )
-  max_seq_len = min(input_mask.shape[-1], seq_len)
-  input_mask = jax.lax.dynamic_slice(
-      input_mask,
-      (0, jnp.maximum(time_step - seq_len + 1, 0)),
-      (bsz, max_seq_len),
-  )
-  input_mask = (
-      jnp.ones((bsz, seq_len), dtype=jnp.bool_)
-      .at[:, :max_seq_len]
-      .set(input_mask)
-  )
-
-  causal_mask = jnp.logical_and(causal_mask, input_mask)
-  attention_mask = causal_mask[:, jnp.newaxis, :].astype(jnp.bool_)
-
-  return attention_mask
-  
-@functools.partial(jax.jit, static_argnums=(0, 1))
-def casual_attention_mask(seq_len: int, max_seq_len: int) -> jax.Array:
-  return jnp.arange(seq_len)[..., None] >= jnp.arange(max_seq_len)[None, ...]
-
-@functools.partial(jax.jit, static_argnums=(1, 2))
-def construct_positions_and_attn_mask(
-  input: jax.Array, max_len: int, pad_id: int) -> tuple[jax.Array, jax.Array]:
-
-  assert input.ndim == 2 and input.shape[-1] <= max_len
-  input_len = input.shape[-1]
-  input = input.astype(jnp.int32)
-  input_mask = input != pad_id
-  # positions are zero-indexed, cumsum gives one-indexed values
-  positions = ((jnp.cumsum(input_mask, axis=-1, dtype=jnp.int32) - 1) 
-               * input_mask)
-  attention_mask = casual_attention_mask(input_len, max_len)[
-    None, ...]
-  pad_len = max(0, max_len - input_len)
-  padded_input_mask= jnp.pad(input_mask, [(0, 0), (0, pad_len)])
-  attention_mask = attention_mask * (input_mask[..., None] 
-                                     * padded_input_mask[..., None, :])
-  return positions, attention_mask
-
-def prefill(transformer: transformer_lib.Transformer, inputs: jax.Array, 
-            pad_id: int):
-  positions, attention_mask = construct_positions_and_attn_mask(
-    inputs, transformer.config.max_cache_length, pad_id)
-  dtype = jax.tree.leaves(nnx.state(transformer))[0].dtype
-  cache = transformer.config.init_cache(inputs.shape[0], dtype=dtype)
-  logits, cache = transformer(inputs, positions, cache, attention_mask)
-  return logits, nnx.state(cache)
-
-
-
 @chex.dataclass
-class _SamplingState:
+class SamplingState:
   """Internal sampling state."""
+  # padding id of the tokenizer
+  pad_id: jnp.int32
+  # end of sequence id
+  eos_id: jnp.int32
 
   # Decoding step.
   decoding_step: jnp.int32
@@ -138,9 +87,129 @@ class SamplerOutput:
 
   # Tokens corresponding to the generated samples.
   tokens: list[list[int]]
+  
+def _compute_attention_masks(
+    time_step: jax.Array, seq_len: int, input_mask: jax.Array
+) -> jax.Array:
+  """Computes causal attention mask."""
+  bsz = input_mask.shape[0]
+  batch_time_step = jnp.full((bsz, 1), time_step, dtype=jnp.uint32)
+  causal_mask = jnp.less_equal(
+      jnp.expand_dims(jnp.arange(seq_len), 0), batch_time_step
+  )
+  max_seq_len = min(input_mask.shape[-1], seq_len)
+  input_mask = jax.lax.dynamic_slice(
+      input_mask,
+      (0, jnp.maximum(time_step - seq_len + 1, 0)),
+      (bsz, max_seq_len),
+  )
+  input_mask = (
+      jnp.ones((bsz, seq_len), dtype=jnp.bool_)
+      .at[:, :max_seq_len]
+      .set(input_mask)
+  )
+
+  causal_mask = jnp.logical_and(causal_mask, input_mask)
+  attention_mask = causal_mask[:, jnp.newaxis, :].astype(jnp.bool_)
+
+  return attention_mask
+
+@functools.partial(jax.jit, static_argnums=(0, 1))
+def casual_attention_mask(seq_len: int, max_seq_len: int) -> jax.Array:
+  return jnp.arange(seq_len)[..., None] >= jnp.arange(max_seq_len)[None, ...]
+
+@functools.partial(jax.jit, static_argnums=(1,))
+def construct_positions_and_attn_mask(input: jax.Array, max_len: int,
+                                      pad_id: int
+                                      ) -> tuple[jax.Array, jax.Array]:
+  """Given a (left and/or right) padded input, create positions and attn_mask"""
+  assert input.ndim == 2 and input.shape[-1] <= max_len
+  input_len = input.shape[-1]
+  input = input.astype(jnp.int32)
+  input_mask = input != pad_id
+  # positions are zero-indexed, cumsum gives one-indexed values
+  positions = ((jnp.cumsum(input_mask, axis=-1, dtype=jnp.int32) - 1)
+               * input_mask)
+  attention_mask = casual_attention_mask(input_len, max_len)[None, ...]
+  pad_len = max(0, max_len - input_len)
+  padded_input_mask = jnp.pad(input_mask, [(0, 0), (0, pad_len)])
+  attention_mask = attention_mask * (input_mask[..., None]
+                                     * padded_input_mask[..., None, :])
+  return positions, attention_mask
+
+@functools.partial(nnx.jit, static_argnums=(3,))
+def prefill(transformer: transformer_lib.Transformer, inputs: jax.Array,
+            pad_id: int, max_len: int):
+  """Ingest context, prefilling the cache for auto-regressive decoding."""
+  dtype = jax.tree.leaves(nnx.state(transformer))[0].dtype
+  config = dataclasses.replace(transformer.config, max_cache_length=max_len)
+  transformer.config = config
+  cache = config.init_cache(inputs.shape[0], dtype=dtype)
+  positions, attention_mask = construct_positions_and_attn_mask(
+    inputs, config.max_cache_length, pad_id)
+  logits, cache = transformer(inputs, positions, cache, attention_mask)
+  return logits, nnx.state(cache)
+
+def sample_step(transformer: transformer_lib.Transformer,
+                sampler_state: SamplingState) -> SamplingState:
+  """Perform a single sampling step."""
+  static_max_len = sampler_state.token_buffer.shape[-1]
+
+  decoding_step = sampler_state.decoding_step
+  last_token = sampler_state.token_buffer[:, decoding_step - 1][..., None]
+  input_mask = (sampler_state.token_buffer != sampler_state.pad_id)[:, None, :]
+  causal_mask = (jnp.arange(static_max_len) < decoding_step)[None, None, :]
+  attention_mask = input_mask & causal_mask
+  positions = sampler_state.positions[:, decoding_step][..., None]
+
+  logits, cache = transformer(last_token, positions, sampler_state.cache,
+                              attention_mask)
+  if sampler_state.forbidden_token_ids:
+    logits = logits.at[:, :, sampler_state.forbidden_token_ids].set(-jnp.inf)
+
+  next_token_candidate = jnp.argmax(logits, axis=-1)  # [B, 1]
+  next_token_candidate = next_token_candidate[:, 0]  # [B,]
+  token_buffer = sampler_state.token_buffer.at[:, decoding_step].set(
+      next_token_candidate
+  )
+
+  if sampler_state.logits_buffer is not None:
+    next_logits = logits[:, 0, ...]
+    logits_buffer = sampler_state.logits_buffer.at[:, decoding_step].set(
+        next_logits
+    )
+  else:
+    logits_buffer = sampler_state.logits_buffer
+
+  done = sampler_state.done | (
+    token_buffer[:, decoding_step] == sampler_state.eos_id)
+
+  return dataclasses.replace(sampler_state,
+                             decoding_step=sampler_state.decoding_step + 1,
+                             token_buffer=token_buffer,
+                             logits_buffer=logits_buffer,
+                             done=done,
+                             cache=nnx.state(cache))
+
+@functools.partial(nnx.jit, donate_argnums=(1,))
+def sample_fn(transformer: transformer_lib.Transformer,
+              initial_sampling_state: SamplingState) -> SamplingState:
+  """Auto-regressive sampling until all sequences reach eos token."""
+
+  def sample_with_params(sampler_state: SamplingState):
+    return sample_step(transformer, sampler_state)
+
+  def cond_fn(sampler_state: SamplingState):
+    step = sampler_state.decoding_step
+    total_steps = sampler_state.total_sampling_steps
+    return (step < total_steps) & jnp.any(jnp.logical_not(sampler_state.done))
+
+  return jax.lax.while_loop(
+      cond_fn, sample_with_params, initial_sampling_state
+  )
 
 @jax.jit
-def mask_tokens_after_eos_ids(token_buffer, eos_id: int, pad_id: int):
+def mask_tokens_after_eos_ids(token_buffer, pad_id: int, eos_id: int):
   """Mask token IDs after the EOS token with the padding ID."""
   eos_exists = jnp.any(jnp.equal(token_buffer, eos_id), axis=-1)
   eos_indices = jnp.where(
@@ -153,6 +222,8 @@ def mask_tokens_after_eos_ids(token_buffer, eos_id: int, pad_id: int):
   )
   return token_buffer * mask + pad_id * (1 - mask)
 
+is_param = lambda x: isinstance(x, nnx.VariableState)
+
 class Sampler:
   """Sampler for gemma transformer."""
 
@@ -161,6 +232,7 @@ class Sampler:
       transformer: transformer_lib.Transformer,
       vocab: spm.SentencePieceProcessor,
       mesh: Mesh | None = None,
+      rules: list[tuple[str, list[str] | str]] | None = None,
   ):
     """Initializes a sampler for a Gemma model.
 
@@ -170,126 +242,107 @@ class Sampler:
       params: weights of the model.
     """
     self.transformer = transformer
+    self.transformer_graphdef, self.transformer_params = nnx.split(transformer)
     self.vocab = vocab
-    self._compiled_prefill_fn = nnx.jit(prefill, static_argnums=(2,))
-    self._compiled_sample_fn = nnx.jit(self._sample_fn)
+    self.mesh, self.rules = mesh, rules
+
+    if (self.mesh is None) ^ (self.rules is None):
+      raise ValueError("When specifying a mesh, you must also logical"
+                       "sharding rules.")
+
+    if self.mesh is None or self.rules is None:
+      # create a transformer-params prefill function
+      def _prefill_fn(transformer_params: nnx.State, inputs: jax.Array,
+                      max_len: int):
+        transformer = nnx.merge(self.transformer_graphdef, transformer_params)
+        return prefill(transformer, inputs, self.vocab.pad_id(), max_len)
+    else:
+      # construct shardings for cache and output logits
+      example_cache = nnx.state(self.transformer.config.init_cache(0))
+      cache_specs = jax.tree.map(lambda x: P(*x.names), example_cache,
+                                 is_leaf=is_param)
+      self.cache_shardings = logical_to_mesh_sharding(cache_specs, mesh, rules)
+      logit_specs = P("batch", "sequence", "vocab")
+      self.logits_sharding = logical_to_mesh_sharding(logit_specs, mesh, rules)
+      out_shardings = (self.logits_sharding, self.cache_shardings)
+
+      # create a sharding consraint enforcing prefill function
+      @functools.partial(jax.jit, static_argnums=(2,),
+                         out_shardings=out_shardings)
+      def _prefill_fn(transformer_params: nnx.State, inputs: jax.Array,
+                   max_len: int):
+        transformer = nnx.merge(self.transformer_graphdef, transformer_params)
+        with self.mesh, logical_axis_rules(self.rules):
+          return prefill(transformer, inputs, self.vocab.pad_id(), max_len)
+
+    self.sample_fn, self.prefill_fn = sample_fn, _prefill_fn
+
 
   @property
   def dtype(self) -> jnp.dtype:
     return jax.tree_util.tree_leaves(nnx.state(self.transformer))[0].dtype
 
-  def _sample_step(self, transformer, sampler_state: _SamplingState
-                   ) -> _SamplingState:
-    """Performs a single sampling step."""
-    static_max_len = self.transformer.config.max_cache_length
-
-    decoding_step = sampler_state.decoding_step
-    last_token = sampler_state.token_buffer[:, decoding_step - 1][..., None]
-    input_mask = (sampler_state.token_buffer != self.vocab.pad_id())[:, None, :]
-    causal_mask = (jnp.arange(static_max_len) < decoding_step)[None, None, :]
-    attention_mask = jnp.logical_and(input_mask, causal_mask)
-    positions = sampler_state.positions[:, decoding_step - 1][..., None]
-
-    logits, cache = transformer(last_token, positions, sampler_state.cache, 
-                                attention_mask)
-    if sampler_state.forbidden_token_ids:
-      logits = logits.at[:, :, sampler_state.forbidden_token_ids].set(-jnp.inf)
-
-    next_token_candidate = jnp.argmax(logits, axis=-1)  # [B, 1]
-    next_token_candidate = next_token_candidate[:, 0]  # [B,]
-    #jax.debug.print("logits = {}", logits[:, :, :16])
-    #jax.debug.print("attention_mask = {}", attention_mask[:, :16] * 1)
-    #jax.debug.print("next_token_candidate = {}", next_token_candidate)
-    #jax.debug.print("position = {}", positions)
-    #jax.debug.print("--------------------------------------------------------------")
-    token_buffer = sampler_state.token_buffer.at[:, decoding_step].set(
-        next_token_candidate
-    )
-
-    if sampler_state.logits_buffer is not None:
-      next_logits = logits[:, 0, ...]
-      logits_buffer = sampler_state.logits_buffer.at[:, decoding_step].set(
-          next_logits
-      )
-    else:
-      logits_buffer = sampler_state.logits_buffer
-
-    done = sampler_state.done | (token_buffer[:, decoding_step + 1] 
-                                 == self.vocab.eos_id())
-
-    return _SamplingState(
-        decoding_step=sampler_state.decoding_step + 1,
-        num_input_tokens=sampler_state.num_input_tokens,
-        token_buffer=token_buffer,
-        positions=sampler_state.positions,
-        logits_buffer=logits_buffer,
-        cache=nnx.state(cache),
-        done=done,
-        total_sampling_steps=sampler_state.total_sampling_steps,
-        forbidden_token_ids=sampler_state.forbidden_token_ids,
-    )
-    
-
-  def _sample_fn(self, transformer, initial_sampling_state: _SamplingState
-                  ) -> _SamplingState:
-    """Internal sampling function (to be jitted)."""
-
-    def sample_with_params(sampler_state: _SamplingState):
-      return self._sample_step(transformer, sampler_state)
-
-    def cond_fn(sampler_state: _SamplingState):
-      return (
-          sampler_state.decoding_step < sampler_state.total_sampling_steps
-      ) & jnp.any(jnp.logical_not(sampler_state.done))
-
-    #return sample_with_params(initial_sampling_state)
-    return jax.lax.while_loop(
-        cond_fn, sample_with_params, initial_sampling_state
-    )
-
-  def _init_sample_state_fn(
+  def init_sample_state(
       self,
       all_input_ids: list[list[int]],
       total_sampling_steps: int,
       include_logits: bool = False,
       forbidden_token_ids: Sequence[int] | None = None,
-  ) -> _SamplingState:
+  ) -> SamplingState:
     """Initializes the sampling state given input prompts."""
 
     bsz = len(all_input_ids)
-    static_max_len = self.transformer.config.max_cache_length
+    static_max_len = next_power_of_two(total_sampling_steps)
     num_input_tokens = [len(input_ids) for input_ids in all_input_ids]
     max_input_len = max(num_input_tokens)
     buffer_size = total_sampling_steps + 1
-    
-    padded_tokens = jnp.array([
-      [self.vocab.pad_id()] * (max_input_len - num_tokens) + input 
-      for (input, num_tokens) in zip(all_input_ids, num_input_tokens)], 
+
+
+    # right align input sequences (left-pad)
+    right_aligned_tokens = jnp.array([
+      [self.vocab.pad_id()] * (max_input_len - num_tokens) + input
+      for (input, num_tokens) in zip(all_input_ids, num_input_tokens)],
       dtype=jnp.int32)
     token_buffer = self.vocab.pad_id() * jnp.ones(
       (bsz, static_max_len), dtype=jnp.int32)
-    token_buffer = token_buffer.at[:, :max_input_len].set(padded_tokens)
+    token_buffer = token_buffer.at[:, :max_input_len].set(right_aligned_tokens)
+
+    # pad inputs further to a power of 2 length to reduce prefill recompilations
     pad_after = min(buffer_size, next_power_of_two(max_input_len)
-                    ) - padded_tokens.shape[-1]
-    padded_tokens = jnp.pad(padded_tokens, ((0, 0), (0, pad_after)))
-    logits, cache = self._compiled_prefill_fn(self.transformer, padded_tokens, 
-                                              self.vocab.pad_id())
+                    ) - right_aligned_tokens.shape[-1]
+    padded_tokens = jnp.pad(right_aligned_tokens, ((0, 0), (0, pad_after)))
+
+    # fill in the cache during prefill stage
+    t = time.time()
+    logits, cache = self.prefill_fn(self.transformer_params, padded_tokens,
+                                    static_max_len)
+    logits.block_until_ready()
+    t = time.time() - t
+    logger.debug(f"Prefill took {t:.4e} s")
+
+    # set the cache end_index to right aligned size, not the power of 2 padded
     for lid in cache.keys():
       cache[lid]["end_index"].value = (
         cache[lid]["end_index"].value.at[:].set(max_input_len))
 
     if include_logits:
-      logits_buffer = jnp.zeros((bsz, static_max_len, logits.shape[-1]), 
+      logits_buffer = jnp.zeros((bsz, static_max_len, logits.shape[-1]),
                                 dtype=self.dtype)
       logits_buffer = logits_buffer.at[:, :padded_tokens.shape[-1], :].set(
         logits)
     else:
       logits_buffer = None
-      
-    pos_shift = max_input_len - jnp.array(num_input_tokens)
-    positions = jnp.arange(static_max_len)[None, :] - pos_shift[:, None]
-      
-    return _SamplingState(
+
+    # compute token positions, skipping padded tokens
+    pad_after = static_max_len - right_aligned_tokens.shape[-1]
+    positions = jnp.concatenate([
+      (right_aligned_tokens != self.vocab.pad_id()).astype(jnp.int32),
+      jnp.ones((bsz, pad_after), dtype=jnp.int32)], -1)
+    positions = jnp.cumsum(positions, -1) - 1
+
+    return SamplingState(
+        pad_id=self.vocab.pad_id(),
+        eos_id=self.vocab.eos_id(),
         decoding_step=max_input_len,
         num_input_tokens=jnp.array(num_input_tokens, dtype=jnp.int32),
         token_buffer=token_buffer,
@@ -311,10 +364,10 @@ class Sampler:
       self,
       input_strings: Sequence[str],
       total_generation_steps: int,
-      echo: bool = True,
+      apply_chat_template: bool,
+      echo: bool = False,
       return_logits: bool = True,
       forbidden_tokens: Sequence[str] | None = None,
-      apply_chat_template: bool = True,
   ) -> SamplerOutput:
     """Samples a completion of the input string.
 
@@ -330,8 +383,8 @@ class Sampler:
     Returns:
       sampler_output: A SamplerOutput object containing the generated samples.
     """
-    
-    chat_template = ("<start_of_turn>user\n{}\n<end_of_turn>\n" 
+
+    chat_template = ("<start_of_turn>user\n{}\n<end_of_turn>\n"
                      "<start_of_turn>model\n")
     if apply_chat_template:
       input_strings = [chat_template.format(x) for x in input_strings]
@@ -349,32 +402,48 @@ class Sampler:
     all_input_ids = [self.tokenize(x) for x in input_strings]
     max_input_length = max(len(input_ids) for input_ids in all_input_ids)
     total_sampling_steps = max_input_length + total_generation_steps
-    initial_sampling_state = self._init_sample_state_fn(
+
+    # initialization including prefill
+    t_init = time.time()
+    initial_sampling_state = self.init_sample_state(
         all_input_ids,
         include_logits=return_logits,
         total_sampling_steps=total_sampling_steps,
         forbidden_token_ids=forbidden_token_ids,
     )
-    sampling_state = self._compiled_sample_fn(self.transformer, 
-                                              initial_sampling_state)
+    inital_size = initial_sampling_state.decoding_step
+    t_init = time.time() - t_init
+    logger.debug(f"Initialization took {t_init:.4e} s")
+
+    # autoregressive sampling
+    t_sampling = time.time()
+    sampling_state = self.sample_fn(self.transformer, initial_sampling_state)
+    t_sampling = time.time() - t_sampling
+    logger.debug(f"AR Sampling took {t_sampling:.4e} s")
+
+    # compute throughput
+    sampled_steps = int(sampling_state.decoding_step - inital_size)
+    logger.debug(f"Throughput: tok / sec: {sampled_steps / t_sampling:.3f} for"
+                 f" {sampled_steps = }")
 
     masked_token_buffer = mask_tokens_after_eos_ids(
-      sampling_state.token_buffer, self.vocab.eos_id(), self.vocab.pad_id())
+      sampling_state.token_buffer, sampling_state.pad_id, sampling_state.eos_id)
 
+    num_longest = jnp.max(sampling_state.num_input_tokens)
     out_tokens, out_logits = [], []
     for i, (token_buffer, num_tokens) in enumerate(
         zip(masked_token_buffer, sampling_state.num_input_tokens)
     ):
-      start_idx = jnp.argmax(sampling_state.positions[i, :] >= 0) + (
-        0 if echo else num_tokens)
+      # start idx is the last 0 position
+      start_idx = num_longest - num_tokens + (0 if echo else num_tokens)
       out_tokens.append(token_buffer[start_idx:total_sampling_steps])
       if return_logits:
         logits_buffer = sampling_state.logits_buffer[i]
         out_logits.append(logits_buffer[start_idx:total_sampling_steps])
 
-    decoded_outputs = [self.vocab.DecodeIds(tokens.tolist()) 
+    decoded_outputs = [self.vocab.DecodeIds(tokens.tolist())
                        for tokens in out_tokens]
 
-    result = SamplerOutput(text=decoded_outputs, logits=out_logits, 
+    result = SamplerOutput(text=decoded_outputs, logits=out_logits,
                            tokens=out_tokens)
     return result
