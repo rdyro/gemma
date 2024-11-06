@@ -158,16 +158,34 @@ class Attention(nnx.Module):
 
     # Cache is left aligned.
     if cache is not None:
-      end_index = cache['end_index'].value[0]
-      slice_indices = (0, end_index % cache['v'].value.shape[1], 0, 0)
-      value_proj = jax.lax.dynamic_update_slice(
-          cache['v'].value,
-          value_proj,
-          slice_indices,
-      )
-      key_proj = jax.lax.dynamic_update_slice(
-          cache['k'].value, key_proj, slice_indices
-      )
+      def update_cache(cache_k, cache_v, key_proj, value_proj, end_index):
+        slice_indices = (end_index % cache['v'].value.shape[1], 0, 0)
+        value_proj = jax.lax.dynamic_update_slice(
+            cache_v, value_proj, slice_indices,
+        )
+        key_proj = jax.lax.dynamic_update_slice(
+            cache_k, key_proj, slice_indices
+        )
+        return key_proj, value_proj
+      
+      key_proj, value_proj = jax.vmap(update_cache)(
+        cache['k'].value, cache['v'].value, key_proj, value_proj, 
+        cache["end_index"].value)
+        
+      key_proj = nn.with_logical_constraint(key_proj, cache['k'].names)
+      value_proj = nn.with_logical_constraint(value_proj, cache['v'].names)
+        
+
+      #end_index = cache['end_index'].value[0]
+      #slice_indices = (0, end_index % cache['v'].value.shape[1], 0, 0)
+      #value_proj = jax.lax.dynamic_update_slice(
+      #    cache['v'].value,
+      #    value_proj,
+      #    slice_indices,
+      #)
+      #key_proj = jax.lax.dynamic_update_slice(
+      #    cache['k'].value, key_proj, slice_indices
+      #)
 
     if self.use_gqa:
       # Reshape matrices to enable einsums over groups.
