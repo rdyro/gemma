@@ -155,15 +155,26 @@ class Attention(nn.Module):
 
     # Cache is left aligned.
     if cache is not None:
-      end_index = cache['end_index'][0]
-      slice_indices = (0, end_index % cache['v'].shape[1], 0, 0)
-      value_proj = jax.lax.dynamic_update_slice(
+      @jax.vmap
+      def _update_cache(end_index, cache_k, cache_v, key_proj, value_proj):
+        slice_indices = (end_index % cache_v.shape[-3], 0, 0)
+        value_proj = jax.lax.dynamic_update_slice(
+            cache_v,
+            value_proj.astype(cache_v.dtype),
+            slice_indices,
+        )
+        key_proj = jax.lax.dynamic_update_slice(
+            cache_k, key_proj.astype(cache_k.dtype), slice_indices
+        )
+        return key_proj, value_proj
+
+      # vmapped cache update
+      key_proj, value_proj = _update_cache(  
+          cache['end_index'],
+          cache['k'],
           cache['v'],
+          key_proj,
           value_proj,
-          slice_indices,
-      )
-      key_proj = jax.lax.dynamic_update_slice(
-          cache['k'], key_proj, slice_indices
       )
 
     if self.use_gqa:
