@@ -137,10 +137,11 @@ def construct_positions_and_attn_mask(input: jax.Array, max_len: int,
                                      * padded_input_mask[..., None, :])
   return positions, attention_mask
 
-@functools.partial(nnx.jit, static_argnums=(3,))
-def prefill(transformer: transformer_lib.Transformer, inputs: jax.Array,
+@functools.partial(jax.jit, static_argnames=("max_len",))
+def prefill(graphdef: nnx.GraphDef, params: nnx.State, inputs: jax.Array,
             pad_id: int, max_len: int):
   """Ingest context, prefilling the cache for auto-regressive decoding."""
+  transformer = nnx.merge(graphdef, params)
   dtype = jax.tree.leaves(nnx.state(transformer))[0].dtype
   config = dataclasses.replace(transformer.config, max_cache_length=max_len)
   transformer.config = config
@@ -191,10 +192,11 @@ def sample_step(transformer: transformer_lib.Transformer,
                              done=done,
                              cache=nnx.state(cache))
 
-@functools.partial(nnx.jit, donate_argnums=(1,))
-def sample_fn(transformer: transformer_lib.Transformer,
+@functools.partial(jax.jit, donate_argnames=("initial_sampling_state",))
+def sample_fn(graphdef: nnx.GraphDef, params: nnx.State,
               initial_sampling_state: SamplingState) -> SamplingState:
   """Auto-regressive sampling until all sequences reach eos token."""
+  transformer = nnx.merge(graphdef, params)
 
   def sample_with_params(sampler_state: SamplingState):
     return sample_step(transformer, sampler_state)
@@ -254,8 +256,8 @@ class Sampler:
       # create a transformer-params prefill function
       def _prefill_fn(transformer_params: nnx.State, inputs: jax.Array,
                       max_len: int):
-        transformer = nnx.merge(self.transformer_graphdef, transformer_params)
-        return prefill(transformer, inputs, self.vocab.pad_id(), max_len)
+        return prefill(self.transformer_graphdef, transformer_params, 
+                       inputs, self.vocab.pad_id(), max_len)
     else:
       # construct shardings for cache and output logits
       example_cache = nnx.state(self.transformer.config.init_cache(0))
@@ -267,13 +269,13 @@ class Sampler:
       out_shardings = (self.logits_sharding, self.cache_shardings)
 
       # create a sharding consraint enforcing prefill function
-      @functools.partial(jax.jit, static_argnums=(2,),
+      @functools.partial(jax.jit, static_argnames=("max_len",),
                          out_shardings=out_shardings)
-      def _prefill_fn(transformer_params: nnx.State, inputs: jax.Array,
-                   max_len: int):
-        transformer = nnx.merge(self.transformer_graphdef, transformer_params)
+      def _prefill_fn(transformer_params: nnx.State, inputs: jax.Array, 
+                      max_len: int):
         with self.mesh, logical_axis_rules(self.rules):
-          return prefill(transformer, inputs, self.vocab.pad_id(), max_len)
+          return prefill(self.transformer_graphdef, transformer_params, inputs, 
+                         self.vocab.pad_id(), max_len)
 
     self.sample_fn, self.prefill_fn = sample_fn, _prefill_fn
 
@@ -402,6 +404,7 @@ class Sampler:
     all_input_ids = [self.tokenize(x) for x in input_strings]
     max_input_length = max(len(input_ids) for input_ids in all_input_ids)
     total_sampling_steps = max_input_length + total_generation_steps
+    logger.debug(f"Total sampling steps = {total_sampling_steps}")
 
     # initialization including prefill
     t_init = time.time()
@@ -411,13 +414,17 @@ class Sampler:
         total_sampling_steps=total_sampling_steps,
         forbidden_token_ids=forbidden_token_ids,
     )
+    initial_sampling_state.token_buffer.block_until_ready()
     inital_size = initial_sampling_state.decoding_step
     t_init = time.time() - t_init
     logger.debug(f"Initialization took {t_init:.4e} s")
 
     # autoregressive sampling
     t_sampling = time.time()
-    sampling_state = self.sample_fn(self.transformer, initial_sampling_state)
+    sampling_state = self.sample_fn(self.transformer_graphdef, 
+                                    self.transformer_params, 
+                                    initial_sampling_state)
+    _ = sampling_state.token_buffer.block_until_ready()
     t_sampling = time.time() - t_sampling
     logger.debug(f"AR Sampling took {t_sampling:.4e} s")
 

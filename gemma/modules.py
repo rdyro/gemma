@@ -73,12 +73,14 @@ class Embedder(nnx.Module):
       rngs(), (self.vocab_size, self.embed_dim)), names=("vocab", "features"))
 
   def encode(self, x: jax.Array) -> jax.Array:
-    x = self.input_embedding.value[(x,)]
-    x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
-    return x
+    with jax.named_scope("vocab_encode"):
+      x = self.input_embedding.value[(x,)]
+      x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
+      return x
 
   def decode(self, x: jax.Array) -> jax.Array:
-    return jnp.dot(x, self.input_embedding.value.T)
+    with jax.named_scope("vocab_decode"):
+      return jnp.dot(x, self.input_embedding.value.T)
 
 
 @dataclass
@@ -158,6 +160,7 @@ class Attention(nnx.Module):
 
     # Cache is left aligned.
     if cache is not None:
+      @jax.vmap
       def update_cache(cache_k, cache_v, key_proj, value_proj, end_index):
         slice_indices = (end_index % cache['v'].value.shape[1], 0, 0)
         value_proj = jax.lax.dynamic_update_slice(
@@ -167,26 +170,13 @@ class Attention(nnx.Module):
             cache_k, key_proj, slice_indices
         )
         return key_proj, value_proj
-      
-      key_proj, value_proj = jax.vmap(update_cache)(
-        cache['k'].value, cache['v'].value, key_proj, value_proj, 
-        cache["end_index"].value)
-        
+
+      end_index = cache["end_index"].value
+      key_proj, value_proj = update_cache(cache['k'].value, cache['v'].value, 
+                                          key_proj, value_proj, end_index)
       key_proj = nn.with_logical_constraint(key_proj, cache['k'].names)
       value_proj = nn.with_logical_constraint(value_proj, cache['v'].names)
         
-
-      #end_index = cache['end_index'].value[0]
-      #slice_indices = (0, end_index % cache['v'].value.shape[1], 0, 0)
-      #value_proj = jax.lax.dynamic_update_slice(
-      #    cache['v'].value,
-      #    value_proj,
-      #    slice_indices,
-      #)
-      #key_proj = jax.lax.dynamic_update_slice(
-      #    cache['k'].value, key_proj, slice_indices
-      #)
-
     if self.use_gqa:
       # Reshape matrices to enable einsums over groups.
       b, t, kg, h = query_scaled.shape
@@ -289,15 +279,17 @@ class FeedForward(nnx.Module):
     gating_einsum_w = self.gating_einsum.value
     if self.transpose_gating_einsum:
       gating_einsum_w = gating_einsum_w.transpose((0, 2, 1))
-    ff_gate = jnp.dot(x, gating_einsum_w[0])
-    gate_value = nn.gelu(ff_gate)
+    with jax.named_scope("ff_up_proj"):
+      ff_gate = jnp.dot(x, gating_einsum_w[0])
+      gate_value = nn.gelu(ff_gate)
 
-    # Up projection
-    ff1 = jnp.dot(x, gating_einsum_w[1])
-    activations = gate_value * ff1
+      # Up projection
+      ff1 = jnp.dot(x, gating_einsum_w[1])
+      activations = gate_value * ff1
 
-    # Down projection
-    outputs = jnp.dot(activations, self.linear.value)
+    with jax.named_scope("ff_down_proj"):
+      # Down projection
+      outputs = jnp.dot(activations, self.linear.value)
 
     return outputs
 
