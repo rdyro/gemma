@@ -71,7 +71,7 @@ class Embedder(nn.Module):
   def setup(self):
     self.input_embedding_table = self.param(
         'input_embedding',
-        nn.with_logical_partitioning(nn.initializers.normal(), 
+        nn.with_logical_partitioning(nn.initializers.normal(),
                                      ("vocab", "features")),
         (self.vocab_size, self.embed_dim),
     )
@@ -109,21 +109,25 @@ class Attention(nn.Module):
     self.attn_vec_einsum = layers.Einsum(
         shape=(self.num_heads, self.head_dim, self.features),
         axis_names=("kv_heads", "head_dim", "features"),
+        quantize=False,
     )
 
     if self.use_qkv_einsum:
       self.qkv_einsum = layers.Einsum(
           shape=(3, self.num_heads, self.features, self.head_dim),
           axis_names=(None, "kv_heads", "features", "head_dim"),
+          quantize=False,
       )
     else:
       self.q_einsum = layers.Einsum(
           shape=(self.num_heads, self.features, self.head_dim),
           axis_names=("q_heads", "features", "head_dim"),
+          quantize=False,
       )
       self.kv_einsum = layers.Einsum(
           shape=(2, self.num_kv_heads, self.features, self.head_dim),
           axis_names=(None, "kv_heads", "features", "head_dim"),
+          quantize=False,
       )
 
   def __call__(
@@ -169,7 +173,7 @@ class Attention(nn.Module):
         return key_proj, value_proj
 
       # vmapped cache update
-      key_proj, value_proj = _update_cache(  
+      key_proj, value_proj = _update_cache(
           cache['end_index'],
           cache['k'],
           cache['v'],
@@ -245,10 +249,10 @@ class Attention(nn.Module):
   ) -> LayerCache:
     del cls  # not used
     v = nn.LogicallyPartitioned(jnp.zeros(
-      (batch_size, cache_size, num_heads, head_dim), dtype=dtype), 
+      (batch_size, cache_size, num_heads, head_dim), dtype=dtype),
       ("batch", "sequence", "kv_heads", "head_dim"))
     k = nn.LogicallyPartitioned(jnp.zeros(
-      (batch_size, cache_size, num_heads, head_dim), dtype=dtype), 
+      (batch_size, cache_size, num_heads, head_dim), dtype=dtype),
       ("batch", "sequence", "kv_heads", "head_dim"))
     end_index = nn.LogicallyPartitioned(
       jnp.zeros((batch_size,), dtype=jnp.int32), ("batch",))
@@ -263,26 +267,51 @@ class FeedForward(nn.Module):
   features: int
   hidden_dim: int
   transpose_gating_einsum: bool
+  quantize: bool
 
-  @nn.compact
+  def setup(self):
+    if self.transpose_gating_einsum:
+      self.gating_einsum = layers.Einsum(
+          shape=(2, self.hidden_dim, self.features),
+          axis_names=(None, "features", "ffw"),
+          quantize=self.quantize,
+      )
+    else:
+      self.gating_einsum = layers.Einsum(
+          shape=(2, self.features, self.hidden_dim),
+          axis_names=(None, "ffw", "features"),
+          quantize=self.quantize,
+      )
+    self.linear = layers.Einsum(
+      shape=(self.hidden_dim, self.features),
+      axis_names=("ffw", "features"),
+      quantize=self.quantize,
+    )
+
+  #@nn.compact
   def __call__(self, x):
     # Some versions use an alternate parameter ordering that
     # transposes hidden_dim and features.
+
+    #if self.transpose_gating_einsum:
+    #  w_gating = self.param(
+    #      'gating_einsum',
+    #      nn.with_logical_partitioning(nn.initializers.normal(),
+    #                                   (None, "ffw", "features"))
+    #      ((2, self.hidden_dim, self.features)),
+    #  )
+    #  w_gating = w_gating.transpose((0, 2, 1))
+    #else:
+    #  w_gating = self.param(
+    #      'gating_einsum',
+    #      nn.with_logical_partitioning(nn.initializers.normal(),
+    #                                   (None, "features", "ffw")),
+    #      ((2, self.features, self.hidden_dim)),
+    #  )
+    w_gating = self.gating_einsum.get_weight()
     if self.transpose_gating_einsum:
-      w_gating = self.param(
-          'gating_einsum',
-          nn.with_logical_partitioning(nn.initializers.normal(),
-                                       (None, "ffw", "features"))
-          ((2, self.hidden_dim, self.features)),
-      )
       w_gating = w_gating.transpose((0, 2, 1))
-    else:
-      w_gating = self.param(
-          'gating_einsum',
-          nn.with_logical_partitioning(nn.initializers.normal(), 
-                                       (None, "features", "ffw")),
-          ((2, self.features, self.hidden_dim)),
-      )
+
     ff_gate = jnp.dot(x, w_gating[0])
     gate_value = nn.gelu(ff_gate)
 
@@ -291,12 +320,14 @@ class FeedForward(nn.Module):
     activations = gate_value * ff1
 
     # Down projection
-    w_linear = self.param(
-        'linear',
-        nn.with_logical_partitioning(nn.initializers.zeros_init(), 
-                                     ("ffw", "features")),
-        (self.hidden_dim, self.features),
-    )
+    #w_linear = self.param(
+    #    'linear',
+    #    nn.with_logical_partitioning(nn.initializers.zeros_init(),
+    #                                 ("ffw", "features")),
+    #    (self.hidden_dim, self.features),
+    #)
+    w_linear = self.linear.get_weight()
+
     outputs = jnp.dot(activations, w_linear)
 
     return outputs
@@ -317,6 +348,7 @@ class Block(nn.Module):
   transpose_gating_einsum: bool
   attn_logits_soft_cap: float | None = None
   sliding_window_size: int | None = None
+  quantize_ffw: bool = False
 
   def setup(self):
     self.pre_attention_norm = layers.RMSNorm()
@@ -339,6 +371,7 @@ class Block(nn.Module):
         features=self.embed_dim,
         hidden_dim=self.hidden_dim,
         transpose_gating_einsum=self.transpose_gating_einsum,
+        quantize=self.quantize_ffw,
     )
     self.post_ffw_norm = None
     if self.use_post_ffw_norm:

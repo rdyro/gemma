@@ -18,19 +18,55 @@ from flax import linen as nn
 import jax
 import jax.numpy as jnp
 
+def quantize_int8(w: jax.Array) -> jax.Array:
+  reduction_axes = (-1, -2) if w.ndim >= 4 else (-1,)
+  amax = jnp.max(jnp.abs(w), axis=reduction_axes, keepdims=True)
+  scale = (amax / 127.0 + jnp.finfo(jnp.float16).tiny).astype(jnp.float16)
+  w_quant = jnp.round(w / scale).astype(jnp.int8)
+  return w_quant, scale
+
+def dequantize_int8(w: jax.Array, scale: jax.Array):
+  return (w * scale).astype(scale.dtype)
 
 class Einsum(nn.Module):
   """Einsum is a convenience module for parameterized tensor multiplication."""
   shape: tuple[int, ...]
   axis_names: list[str]
-  
+  quantize: bool = False
+
   def setup(self):
-    weight_init_fn = nn.with_logical_partitioning(nn.initializers.normal(), 
+    init_fn = nn.initializers.normal()
+
+    if self.quantize:
+      if len(self.shape) >= 4:
+        s_shape = self.shape[:-2] + (1, 1)
+        s_axis_names = self.axis_names[:-2] + (None, None)
+      else:
+        s_shape = self.shape[:-1] + (1,)
+        s_axis_names = self.axis_names[:-1] + (None,)
+      scale_init_fn = nn.with_logical_partitioning(nn.initializers.ones_init(),
+                                                   s_axis_names)
+      self.s = self.param('s', scale_init_fn, s_shape)
+
+      # modify the weight init function to output int8
+      base_init_fn = init_fn
+      init_fn = lambda *args, **kw: quantize_int8(base_init_fn(*args, **kw))[0]
+
+    weight_init_fn = nn.with_logical_partitioning(init_fn,
                                                   self.axis_names)
     self.w = self.param('w', weight_init_fn, self.shape)
 
   def __call__(self, eqn: str, x: jax.Array) -> jax.Array:
-    return jnp.einsum(eqn, x, self.w)
+    if self.quantize:
+      return jnp.einsum(eqn, x, dequantize_int8(self.w))
+    else:
+      return jnp.einsum(eqn, x, self.w)
+
+  def get_weight(self):
+    if self.quantize:
+      return dequantize_int8(self.w, self.s)
+    else:
+      return self.w
 
 
 class RMSNorm(nn.Module):
@@ -38,7 +74,7 @@ class RMSNorm(nn.Module):
 
   @nn.compact
   def __call__(self, x):
-    scale_init = nn.with_logical_partitioning(nn.initializers.zeros_init(), 
+    scale_init = nn.with_logical_partitioning(nn.initializers.zeros_init(),
                                               ("features",))
     scale = self.param('scale', scale_init, (x.shape[-1]))
     var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)

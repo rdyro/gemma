@@ -1,7 +1,7 @@
 import os
 import functools
 import time
-from typing import Callable
+from typing import Callable, Any
 import dataclasses
 from pathlib import Path
 import logging
@@ -21,6 +21,7 @@ from tqdm import tqdm
 from gemma import params as params_lib
 from gemma import transformer as transformer_lib
 from gemma import sampler as sampler_lib
+from gemma.layers import quantize_int8
 import sentencepiece as spm
 import kagglehub
 
@@ -35,8 +36,9 @@ sampler_logger = logging.getLogger(sampler_lib.__name__)
 
 
 VARIANT = "gemma2-27b-it"
-#os.environ["MODEL_CHECKPOINT_PATH"] = str(Path(f"~/storage/{VARIANT}").expanduser())
-#os.environ["TOKENIZER_PATH"] = str(Path("~/storage/tokenizer.model").expanduser())
+QUANTIZE_FFW = True
+PROFILE = False
+
 weights_dir = Path("~/storage").expanduser()
 ckpt_path = os.environ["MODEL_CHECKPOINT_PATH"]
 vocab_path = os.environ["TOKENIZER_PATH"]
@@ -178,11 +180,25 @@ def extract_answers(tokens: jax.Array):
     answers.append(ans)
   return np.array(answers)
 
+def quantize_int8_params(params: dict[str, Any]):
+  assert "layer_0" in params, 'Provide params["params"]'
+  # a deepcopy without copying leaves
+  params_quant = jax.tree.unflatten(jax.tree.structure(params), 
+                                    jax.tree.leaves(params))
+  for layer_name, layer in [kv for kv in params.items() if "layer_" in kv[0]]:
+    for name, weight in layer["mlp"].items():
+      params_quant[layer_name]["mlp"][name] = dict(
+        zip(("w", "s"), quantize_int8(weight)))
+  return params_quant
+
 def main():
   if "2b" in VARIANT:
     config = transformer_lib.TransformerConfig.gemma2_2b(cache_size=MAX_LENGTH)
   else:
     config = transformer_lib.TransformerConfig.gemma2_27b(cache_size=MAX_LENGTH)
+  if QUANTIZE_FFW:
+    config = dataclasses.replace(config, quantize_ffw=True)
+  
   state_abstract, _ = jax.eval_shape(lambda: eval_model_abstract(config))
 
   mesh = jax.sharding.Mesh(compute_devices, ("x",))
@@ -209,6 +225,8 @@ def main():
   with jax.default_device(jax.devices("cpu")[0]):
     params = params_lib.load_and_format_params(ckpt_path)
     params = params["transformer"]
+    if QUANTIZE_FFW:
+      params = quantize_int8_params(params)  # on CPU
     shardings_flat = jax.tree.leaves(state_shardings)
     params_flat = jax.jit(lambda x: jax.tree.leaves(x), 
                           out_shardings=shardings_flat)(params)
@@ -219,12 +237,13 @@ def main():
   # MMLU eval loop #######################
   dl, num_batches = get_dataloader("test")
   
-  batch = next(iter(dl))
-  with mesh, nn.logical_axis_rules(rules):
-    gen_tokens = transformer_generate(transformer_params, batch, config, 8)
-  with jax.profiler.trace("mmlu-profiles"):
+  if PROFILE:
+    batch = next(iter(dl))
     with mesh, nn.logical_axis_rules(rules):
       gen_tokens = transformer_generate(transformer_params, batch, config, 8)
+    with jax.profiler.trace("mmlu-profiles"):
+      with mesh, nn.logical_axis_rules(rules):
+        gen_tokens = transformer_generate(transformer_params, batch, config, 8)
 
   pbar = tqdm(dl, total=num_batches)
   total, correct = 0, 0

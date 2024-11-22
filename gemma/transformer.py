@@ -70,6 +70,7 @@ class TransformerConfig:
   attn_logits_soft_cap: float | None = None
   sliding_window_size: int | None = None
   transpose_gating_einsum: bool = False
+  quantize_ffw: bool = False
 
   def query_pre_attn_scalar(self) -> float:
     """Returns the scalar to multiply the query by before attention."""
@@ -274,6 +275,7 @@ class Transformer(nn.Module):
             attn_type=attn_type,
             query_pre_attn_scalar=self.config.query_pre_attn_scalar(),
             transpose_gating_einsum=self.config.transpose_gating_einsum,
+            quantize_ffw=self.config.quantize_ffw,
         )
         for i, attn_type in zip(
             range(self.config.num_layers), self.config.attention_types
