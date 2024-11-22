@@ -96,6 +96,7 @@ class Attention(nn.Module):
   query_pre_attn_scalar: float
   attn_logits_soft_cap: float | None = None
   sliding_window_size: int | None = None
+  quantized_attn_projs: bool = False
 
   @property
   def use_qkv_einsum(self):
@@ -109,25 +110,25 @@ class Attention(nn.Module):
     self.attn_vec_einsum = layers.Einsum(
         shape=(self.num_heads, self.head_dim, self.features),
         axis_names=("kv_heads", "head_dim", "features"),
-        quantize=False,
+        quantized=self.quantized_attn_projs,
     )
 
     if self.use_qkv_einsum:
       self.qkv_einsum = layers.Einsum(
           shape=(3, self.num_heads, self.features, self.head_dim),
           axis_names=(None, "kv_heads", "features", "head_dim"),
-          quantize=False,
+          quantized=self.quantized_attn_projs,
       )
     else:
       self.q_einsum = layers.Einsum(
           shape=(self.num_heads, self.features, self.head_dim),
           axis_names=("q_heads", "features", "head_dim"),
-          quantize=False,
+          quantized=self.quantized_attn_projs,
       )
       self.kv_einsum = layers.Einsum(
           shape=(2, self.num_kv_heads, self.features, self.head_dim),
           axis_names=(None, "kv_heads", "features", "head_dim"),
-          quantize=False,
+          quantized=self.quantized_attn_projs,
       )
 
   def __call__(
@@ -267,25 +268,25 @@ class FeedForward(nn.Module):
   features: int
   hidden_dim: int
   transpose_gating_einsum: bool
-  quantize: bool
+  quantized: bool
 
   def setup(self):
     if self.transpose_gating_einsum:
       self.gating_einsum = layers.Einsum(
           shape=(2, self.hidden_dim, self.features),
           axis_names=(None, "features", "ffw"),
-          quantize=self.quantize,
+          quantized=self.quantized,
       )
     else:
       self.gating_einsum = layers.Einsum(
           shape=(2, self.features, self.hidden_dim),
           axis_names=(None, "ffw", "features"),
-          quantize=self.quantize,
+          quantized=self.quantized,
       )
     self.linear = layers.Einsum(
       shape=(self.hidden_dim, self.features),
       axis_names=("ffw", "features"),
-      quantize=self.quantize,
+      quantized=self.quantized,
     )
 
   #@nn.compact
@@ -348,7 +349,8 @@ class Block(nn.Module):
   transpose_gating_einsum: bool
   attn_logits_soft_cap: float | None = None
   sliding_window_size: int | None = None
-  quantize_ffw: bool = False
+  quantized_ffw: bool = False
+  quantized_attn_projs: bool = False
 
   def setup(self):
     self.pre_attention_norm = layers.RMSNorm()
@@ -361,6 +363,7 @@ class Block(nn.Module):
         query_pre_attn_scalar=self.query_pre_attn_scalar,
         attn_logits_soft_cap=self.attn_logits_soft_cap,
         sliding_window_size=self.sliding_window_size,
+        quantized_attn_projs=self.quantized_attn_projs,
     )
     self.post_attention_norm = None
     if self.use_post_attn_norm:
@@ -371,7 +374,7 @@ class Block(nn.Module):
         features=self.embed_dim,
         hidden_dim=self.hidden_dim,
         transpose_gating_einsum=self.transpose_gating_einsum,
-        quantize=self.quantize_ffw,
+        quantized=self.quantized_ffw,
     )
     self.post_ffw_norm = None
     if self.use_post_ffw_norm:

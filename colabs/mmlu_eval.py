@@ -36,7 +36,7 @@ sampler_logger = logging.getLogger(sampler_lib.__name__)
 
 
 VARIANT = "gemma2-27b-it"
-QUANTIZE_FFW = True
+QUANTIZE = True
 PROFILE = False
 
 weights_dir = Path("~/storage").expanduser()
@@ -180,15 +180,21 @@ def extract_answers(tokens: jax.Array):
     answers.append(ans)
   return np.array(answers)
 
-def quantize_int8_params(params: dict[str, Any]):
+def quantize_int8_params(params: dict[str, Any], config):
   assert "layer_0" in params, 'Provide params["params"]'
   # a deepcopy without copying leaves
   params_quant = jax.tree.unflatten(jax.tree.structure(params), 
                                     jax.tree.leaves(params))
   for layer_name, layer in [kv for kv in params.items() if "layer_" in kv[0]]:
-    for name, weight in layer["mlp"].items():
-      params_quant[layer_name]["mlp"][name] = dict(
-        zip(("w", "s"), quantize_int8(weight)))
+    if config.quantized_ffw:
+      for name, weight in layer["mlp"].items():
+        params_quant[layer_name]["mlp"][name] = dict(
+          zip(("w", "s"), quantize_int8(weight)))
+    if config.quantized_attn_projs:
+      for name, weight in layer["attn"].items():
+        weight_quant, scale = quantize_int8(weight["w"])
+        params_quant[layer_name]["attn"][name]["w"] = weight_quant
+        params_quant[layer_name]["attn"][name]["s"] = scale
   return params_quant
 
 def main():
@@ -196,8 +202,9 @@ def main():
     config = transformer_lib.TransformerConfig.gemma2_2b(cache_size=MAX_LENGTH)
   else:
     config = transformer_lib.TransformerConfig.gemma2_27b(cache_size=MAX_LENGTH)
-  if QUANTIZE_FFW:
-    config = dataclasses.replace(config, quantize_ffw=True)
+  if QUANTIZE:
+    config = dataclasses.replace(config, quantized_ffw=True)
+    config = dataclasses.replace(config, quantized_attn_projs=True)
   
   state_abstract, _ = jax.eval_shape(lambda: eval_model_abstract(config))
 
@@ -222,11 +229,18 @@ def main():
   state_shardings = jax.tree.map(lambda x: nn.logical_to_mesh_sharding(
     P(*x.names), mesh, rules), state_abstract, is_leaf=is_param)
 
+  quantized_checkpoint_dir = Path(os.environ["QUANTIZED_CHECKPOINT_PATH"]).expanduser().resolve()
   with jax.default_device(jax.devices("cpu")[0]):
-    params = params_lib.load_and_format_params(ckpt_path)
-    params = params["transformer"]
-    if QUANTIZE_FFW:
-      params = quantize_int8_params(params)  # on CPU
+    if quantized_checkpoint_dir.exists():
+      print("Loading from a new checkpoint format...")
+      params = params_lib.load_params_new(quantized_checkpoint_dir)
+    else:
+      params = params_lib.load_and_format_params(ckpt_path)
+      params = params["transformer"]
+      if QUANTIZE:
+        params = quantize_int8_params(params, config)  # on CPU
+      print("Saving to a new checkpoint format...")
+      params_lib.save_params_new(params, quantized_checkpoint_dir)
     shardings_flat = jax.tree.leaves(state_shardings)
     params_flat = jax.jit(lambda x: jax.tree.leaves(x), 
                           out_shardings=shardings_flat)(params)

@@ -16,10 +16,13 @@
 
 import functools
 from typing import Any, Mapping, Optional
+import dataclasses
 
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint
+from orbax.checkpoint._src.serialization.type_handlers import ArrayRestoreArgs
+import numpy as np
 
 Params = Mapping[str, Any]
 
@@ -46,7 +49,24 @@ def load_params(path: str) -> Params:
   checkpointer = orbax.checkpoint.PyTreeCheckpointer()
   params = checkpointer.restore(path)
   return params
+  
+def load_params_new(path: str):
+  """Loads parameters from a checkpoint path."""
+  checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+  metadata = checkpointer.metadata(path)
+  cpu_sharding = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
+  restore_args = jax.tree.map(lambda x: ArrayRestoreArgs(
+    global_shape=x.shape, sharding=cpu_sharding), metadata)
+  params = jax.tree.map(np.array, 
+                        checkpointer.restore(path, restore_args=restore_args))
+  return params
 
+def save_params_new(params: dict[str, Any], path: str):
+  """Saves parameters to a checkpoint path."""
+  checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+  save_args = jax.tree_util.tree_map(
+    lambda _: orbax.checkpoint.SaveArgs(), params)
+  checkpointer.save(path, params, save_args=save_args)
 
 def param_remapper(orig_params: Params) -> Params:
   """Remaps params to new module layout.

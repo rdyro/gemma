@@ -32,12 +32,12 @@ class Einsum(nn.Module):
   """Einsum is a convenience module for parameterized tensor multiplication."""
   shape: tuple[int, ...]
   axis_names: list[str]
-  quantize: bool = False
+  quantized: bool = False
 
   def setup(self):
     init_fn = nn.initializers.normal()
 
-    if self.quantize:
+    if self.quantized:
       if len(self.shape) >= 4:
         s_shape = self.shape[:-2] + (1, 1)
         s_axis_names = self.axis_names[:-2] + (None, None)
@@ -57,13 +57,13 @@ class Einsum(nn.Module):
     self.w = self.param('w', weight_init_fn, self.shape)
 
   def __call__(self, eqn: str, x: jax.Array) -> jax.Array:
-    if self.quantize:
-      return jnp.einsum(eqn, x, dequantize_int8(self.w))
+    if self.quantized:
+      return jnp.einsum(eqn, x, dequantize_int8(self.w, self.s))
     else:
       return jnp.einsum(eqn, x, self.w)
 
   def get_weight(self):
-    if self.quantize:
+    if self.quantized:
       return dequantize_int8(self.w, self.s)
     else:
       return self.w
